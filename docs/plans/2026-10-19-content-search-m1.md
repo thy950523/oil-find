@@ -47,6 +47,14 @@ import XCTest
 @testable import OilFindApp
 
 final class ContentSearchSupportTests: XCTestCase {
+    /// Deterministic, so a failure is reproducible. `UInt8.random` here only adds flakiness.
+    private func pseudorandomBytes(_ count: Int) -> Data {
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        return Data((0..<count).map { _ in
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return UInt8(truncatingIfNeeded: state >> 33)
+        })
+    }
     private func roundTrip(_ data: Data) throws {
         for compact in [false, true] {
             let packed = ContentCompression.pack(data, compact: compact)
@@ -54,9 +62,9 @@ final class ContentSearchSupportTests: XCTestCase {
         }
     }
     func testCompressionRoundTrips() throws {
-        for text in ["", "收据", String(repeating: "开具发票的日期 ", count: 5000),
-                     String((0..<4096).map { _ in Character(UnicodeScalar(UInt8.random(in: 32...126))) })] {
-            try roundTrip(Data(text.utf8))
+        for data in [Data(), Data("收据".utf8), Data(String(repeating: "开具发票的日期 ", count: 5000).utf8),
+                     pseudorandomBytes(4096)] {
+            try roundTrip(data)
         }
     }
     func testCompressibleInputActuallyCompresses() throws {
@@ -65,10 +73,25 @@ final class ContentSearchSupportTests: XCTestCase {
     }
     func testIncompressibleInputFallsBackToRaw() throws {
         // Random bytes cannot shrink, so pack must store them verbatim behind the raw codec.
-        let raw = Data((0..<4096).map { _ in UInt8.random(in: 0...255) })
+        let raw = pseudorandomBytes(4096)
         let packed = ContentCompression.pack(raw, compact: true)
         XCTAssertEqual(packed.first, 0)
         XCTAssertEqual(Data(packed.dropFirst()), raw)
+    }
+    func testCodecBytesAreStable() throws {
+        // The codec byte is persisted; changing it silently invalidates every existing index.
+        let compressible = Data(String(repeating: "开具发票的日期 ", count: 5000).utf8)
+        XCTAssertEqual(ContentCompression.pack(compressible, compact: true).first, 2)   // zlib
+        XCTAssertEqual(ContentCompression.pack(compressible, compact: false).first, 1)  // lzfse
+        XCTAssertEqual(ContentCompression.pack(Data([1]), compact: true).first, 0)      // raw fallback
+    }
+    func testWrongBodyLengthThrows() throws {
+        let raw = Data(String(repeating: "abcdefghij", count: 1000).utf8)
+        let packed = ContentCompression.pack(raw, compact: true)
+        XCTAssertEqual(try ContentCompression.unpack(packed, bytes: raw.count), raw)
+        XCTAssertThrowsError(try ContentCompression.unpack(packed, bytes: raw.count - 1))
+        XCTAssertThrowsError(try ContentCompression.unpack(packed, bytes: raw.count + 1))
+        XCTAssertThrowsError(try ContentCompression.unpack(packed, bytes: ContentCompression.maxBodyBytes + 1))
     }
     func testDamagedBodiesThrow() throws {
         XCTAssertThrowsError(try ContentCompression.unpack(Data(), bytes: 4))           // no codec byte
@@ -103,6 +126,7 @@ Expected: 编译失败，`cannot find 'ContentCompression' in scope`
 
 ```swift
 import Foundation
+import Compression
 
 /// Shared by every content search component. Defined here so Task 1 compiles on its own.
 enum ContentIndexError: Error, LocalizedError {
@@ -117,8 +141,15 @@ enum ContentIndexError: Error, LocalizedError {
 /// The AI topic decoder writes into a reusable buffer to avoid allocating on its search path,
 /// which is not worth sharing here. Callers store the uncompressed length next to the body, so
 /// decoding is a single exact-size pass and needs no growth guessing.
+///
+/// There is no checksum: a bit flip that still decodes to exactly `bytes` bytes yields silently
+/// wrong text. That is acceptable because the index is derived and rebuildable.
 enum ContentCompression {
     private enum Codec: UInt8 { case raw = 0, lzfse = 1, zlib = 2 }
+
+    /// Ceiling on a single body, so a corrupt `bytes` column cannot drive an unbounded
+    /// allocation on the search path. Chunks are written at 32-64 KiB, so this is generous.
+    static let maxBodyBytes = 16 * 1024 * 1024
 
     static func pack(_ data: Data, compact: Bool = false) -> Data {
         let capacity = data.count
@@ -147,17 +178,21 @@ enum ContentCompression {
             guard body.count == bytes else { throw ContentIndexError.database("Truncated raw body") }
             return Data(body)
         }
-        guard bytes > 0 else { throw ContentIndexError.database("Missing body length") }
-        var output = Data(count: bytes)
+        guard bytes > 0, bytes <= maxBodyBytes else { throw ContentIndexError.database("Body length out of range") }
+        // Decode into one extra byte. The decoder reports a partial fill as success, so without
+        // the spare byte a body longer than `bytes` would be truncated silently instead of
+        // rejected. A body that is exactly `bytes` long still reports `bytes`.
+        var output = Data(count: bytes + 1)
         let written = output.withUnsafeMutableBytes { destination -> Int in
             body.withUnsafeBytes { source -> Int in
                 guard let out = destination.bindMemory(to: UInt8.self).baseAddress,
                       let input = source.bindMemory(to: UInt8.self).baseAddress else { return 0 }
-                return compression_decode_buffer(out, bytes, input, body.count, nil,
+                return compression_decode_buffer(out, bytes + 1, input, body.count, nil,
                                                  codec == .zlib ? COMPRESSION_ZLIB : COMPRESSION_LZFSE)
             }
         }
         guard written == bytes else { throw ContentIndexError.database("Cannot decompress body") }
+        output.count = bytes
         return output
     }
 }
