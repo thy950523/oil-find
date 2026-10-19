@@ -962,6 +962,10 @@ import Foundation
 protocol ContentParser {
     /// Stable identifier stored in `files.parser`; changing it invalidates indexed rows.
     var identifier: String { get }
+    /// File-index kinds this parser handles: 3 = document, 4 = image.
+    var kinds: Set<UInt8> { get }
+    /// Lowercased extensions, or `["*"]` for every file of those kinds.
+    var extensions: Set<String> { get }
     func parse(url: URL, budget: AITopicWorkBudget, isCancelled: () -> Bool) throws -> [ContentChunk]
 }
 
@@ -977,7 +981,12 @@ import Vision
 /// Vision text recognition. Revision is part of the identifier so a revision change reindexes.
 struct ImageOCRParser: ContentParser {
     static let revision = VNRecognizeTextRequestRevision3
+    /// Formats `CGImageSource` can decode. SVG, PSD, AI and camera raw are deliberately absent.
+    static let supportedExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "heic", "heif", "webp",
+                                                   "bmp", "tif", "tiff", "avif", "icns", "ico"]
     var identifier: String { "ocr-\(Self.revision)" }
+    var kinds: Set<UInt8> { [4] }
+    var extensions: Set<String> { Self.supportedExtensions }
 
     /// Long edges above this are downsampled first: recognition cost grows with pixel count and
     /// `perform` cannot yield, so a smaller image keeps single-file latency bounded.
@@ -1101,10 +1110,13 @@ struct TextParser: ContentParser {
     var maximumBytes = 32 * 1024 * 1024
     var chunkBytes = 64 * 1024
     var identifier: String { "text-1" }
+    var kinds: Set<UInt8> { [3] }
+    var extensions: Set<String> { ["txt", "md", "markdown", "csv", "tsv", "log"] }
 
     func parse(url: URL, budget: AITopicWorkBudget, isCancelled: () -> Bool) throws -> [ContentChunk] {
-        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-        guard (size ?? 0) <= maximumBytes else { throw ContentParserError.tooLarge }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attributes?[.size] as? Int) ?? 0
+        guard size <= maximumBytes else { throw ContentParserError.tooLarge }
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
         let text = try Self.decode(data)
         guard !text.isEmpty else { return [] }
@@ -1126,11 +1138,17 @@ struct TextParser: ContentParser {
         return chunks
     }
 
-    /// UTF-8 first, then UTF-16 when the BOM or a NUL pattern says so, then GB18030 for the
-    /// legacy Chinese files that are still common in exports and downloads.
+    /// UTF-8 first, then UTF-16 when a BOM says so, then GB18030 for the legacy Chinese files
+    /// that are still common in exports and downloads.
+    ///
+    /// UTF-16 is only accepted with a BOM. Without one, almost any byte sequence "decodes" as
+    /// UTF-16 into garbage, which would silently win over the correct GB18030 reading. The cost
+    /// is that a BOM-less UTF-16 file is read as GB18030 instead; that is the rarer case.
     static func decode(_ data: Data) throws -> String {
         if let text = String(data: data, encoding: .utf8) { return text }
-        if let text = String(data: data, encoding: .utf16) { return text }
+        let prefix = [UInt8](data.prefix(2))
+        if prefix == [0xFF, 0xFE] || prefix == [0xFE, 0xFF],
+           let text = String(data: data, encoding: .utf16) { return text }
         let gb18030 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
             CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
         if let text = String(data: data, encoding: gb18030) { return text }
@@ -1165,6 +1183,16 @@ git commit -m "feat(content): parse plain text with encoding fallback"
 import XCTest
 import OilFindCore
 @testable import OilFindApp
+
+/// Stands in for a real parser where the test only cares about selection, not extraction.
+private struct StubParser: ContentParser {
+    let identifier: String
+    let kinds: Set<UInt8>
+    var extensions: Set<String> { ["*"] }
+    func parse(url: URL, budget: AITopicWorkBudget, isCancelled: () -> Bool) throws -> [ContentChunk] {
+        [ContentChunk(ordinal: 0, label: "", text: "开具发票")]
+    }
+}
 
 final class ContentIndexerTests: XCTestCase {
     private var dir: URL!, db: URL!, index: ContentIndex!
@@ -1220,6 +1248,16 @@ final class ContentIndexerTests: XCTestCase {
         try FileManager.default.removeItem(at: text)
         try indexer.synchronize(store: store(root: dir.path, names: [""], kinds: [1]), isCancelled: { false })
         XCTAssertEqual(try index.count(), 0)
+    }
+
+    func testImageEntriesUseTheImageParser() throws {
+        // A stub keeps this test off the Vision runtime; it only checks parser selection.
+        let png = dir.appendingPathComponent("shot.png"); try Data([0x89]).write(to: png)
+        let indexer = ContentIndexer(index: index, parsers: [StubParser(identifier: "stub-ocr", kinds: [4])])
+        try indexer.synchronize(store: store(root: dir.path, names: ["", "shot.png"], kinds: [1, 4]),
+                                isCancelled: { false })
+        XCTAssertEqual(try index.file(path: png.path)?.record.parser, "stub-ocr")
+        XCTAssertEqual(try index.count(), 1)
     }
 
     func testDamagedFileIsSkippedAndCounted() throws {
@@ -1294,13 +1332,14 @@ final class ContentIndexer {
         }
     }
 
+    /// Selection is data-driven so a parser's reach is declared where the parser lives, and so a
+    /// test can substitute a stub without depending on Vision.
     private func parser(for path: String, kind: UInt8) -> ContentParser? {
         let ext = (path as NSString).pathExtension.lowercased()
-        guard kind == 3, Self.textExtensions.contains(ext) else { return nil }
-        return parsers.first { $0 is TextParser }
+        return parsers.first {
+            $0.kinds.contains(kind) && ($0.extensions.contains("*") || $0.extensions.contains(ext))
+        }
     }
-
-    static let textExtensions: Set<String> = ["txt", "md", "markdown", "csv", "tsv", "log"]
 }
 ```
 
