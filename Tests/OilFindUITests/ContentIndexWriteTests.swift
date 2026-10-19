@@ -159,6 +159,29 @@ final class ContentIndexWriteTests: XCTestCase {
         XCTAssertNotNil(try index.file(path: "/a/b.txt"))
     }
 
+    /// A second writer must retry past `SQLITE_BUSY` in `beginImmediate` rather than failing the
+    /// open. Holding the write lock past the connection's 1 s busy timeout forces the first
+    /// `BEGIN IMMEDIATE` to return BUSY; the check reads `sqlite3_errcode`, so translating the
+    /// thrown wrapper error must not disturb the retry.
+    func testConcurrentOpenRetriesTheBusyMigrationLock() throws {
+        if ProcessInfo.processInfo.environment["CI"] != nil {
+            throw XCTSkip("Timing-sensitive busy-lock retry check")
+        }
+        let holder = try AITopicSQL(url)
+        try holder.run("BEGIN IMMEDIATE")
+        let opened = expectation(description: "second open retries past SQLITE_BUSY")
+        var failure: Error?
+        DispatchQueue.global().async {
+            do { _ = try ContentIndex(url: self.url) } catch { failure = error }
+            opened.fulfill()
+        }
+        Thread.sleep(forTimeInterval: 1.5)
+        try holder.run("ROLLBACK")
+        wait(for: [opened], timeout: 5)
+        XCTAssertNil(failure)
+        XCTAssertEqual(try index.count(), 0)
+    }
+
     func testUpsertBumpsRevisionWhenKindOrParserChanges() throws {
         let base = ContentFileRecord(path: "/a/b.pdf", size: 10, mtime: 100, kind: 3, parser: "pdf")
         _ = try index.upsert(file: base)

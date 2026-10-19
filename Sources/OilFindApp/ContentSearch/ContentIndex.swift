@@ -94,7 +94,7 @@ final class ContentIndex {
         let deadline = Date().addingTimeInterval(2)
         while true {
             do {
-                try sql.run("BEGIN IMMEDIATE")
+                try run("BEGIN IMMEDIATE")
                 return
             } catch {
                 guard sqlite3_errcode(sql.db) == SQLITE_BUSY, Date() < deadline else { throw error }
@@ -124,19 +124,19 @@ final class ContentIndex {
             guard sqlite3_errcode(sql.db) == SQLITE_BUSY else { throw error }
             usesWAL = false
         }
-        try sql.run("PRAGMA foreign_keys=ON")
+        try run("PRAGMA foreign_keys=ON")
         // BEGIN IMMEDIATE serialises two writable connections opening the same fresh database: the
         // loser waits, then re-probes the version below and skips the winner's rebuild.
         try beginImmediate()
         do {
             if try storedVersion() != Int64(Self.schemaVersion) {
-                try sql.run("""
+                try run("""
                     DROP TRIGGER IF EXISTS chunk_postings_delete;
                     DROP TABLE IF EXISTS chunk_fts;
                     DROP TABLE IF EXISTS chunks;
                     DROP TABLE IF EXISTS files;
                     """)
-                try sql.run("""
+                try run("""
                     CREATE TABLE files(
                         -- AUTOINCREMENT: chunks reference files.id; rowid reuse after a delete would let a stale chunk attach to a new file.
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,11 +165,11 @@ final class ContentIndex {
                         DELETE FROM chunk_fts WHERE rowid = old.id;
                     END;
                     """)
-                try sql.run("PRAGMA user_version = \(Self.schemaVersion)")
+                try run("PRAGMA user_version = \(Self.schemaVersion)")
             }
-            try sql.run("COMMIT")
+            try run("COMMIT")
         } catch {
-            try? sql.run("ROLLBACK")
+            try? run("ROLLBACK")
             throw error
         }
     }
@@ -200,6 +200,13 @@ extension ContentIndex {
     @discardableResult
     func step(_ statement: AITopicStatement) throws -> Bool {
         do { return try statement.next() }
+        catch { throw ContentIndexError.database(error.localizedDescription) }
+    }
+
+    /// Mirrors `step`: `AITopicSQL.run` throws the shared wrapper's error type, and callers of
+    /// this class should only ever see `ContentIndexError`.
+    func run(_ sql: String) throws {
+        do { try self.sql.run(sql) }
         catch { throw ContentIndexError.database(error.localizedDescription) }
     }
 
@@ -340,13 +347,13 @@ extension ContentIndex {
         // `sqlite3_get_autocommit` reports SQLite's own state, so unlike a separate flag it cannot
         // desynchronise when a best-effort ROLLBACK fails and leave the connection unusable.
         if sqlite3_get_autocommit(sql.db) == 0 { return try work() }
-        try sql.run("BEGIN IMMEDIATE")
+        try run("BEGIN IMMEDIATE")
         do {
             let result = try work()
-            try sql.run("COMMIT")
+            try run("COMMIT")
             return result
         } catch {
-            try? sql.run("ROLLBACK")
+            try? run("ROLLBACK")
             throw error
         }
     }
