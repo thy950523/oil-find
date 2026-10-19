@@ -57,7 +57,7 @@
 
 ```sql
 CREATE TABLE files(
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,     -- 文件身份，见第 2 节
     size INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
@@ -66,7 +66,7 @@ CREATE TABLE files(
     revision INTEGER NOT NULL DEFAULT 1);
 
 CREATE TABLE chunks(
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,      -- 页号 / slide 序号 / sheet 序号 / 段序
     label TEXT NOT NULL,           -- "第 3 页" / "第 2 张幻灯片" / "Sheet1"
@@ -75,6 +75,8 @@ CREATE TABLE chunks(
 
 CREATE VIRTUAL TABLE chunk_fts USING fts5(grams, content='', contentless_delete=1, detail=none);
 ```
+
+`AUTOINCREMENT` 不是随手加的：FTS 行以 `chunks.id` 为 key，普通 `INTEGER PRIMARY KEY` 在删除后会复用 rowid，一个新块可能继承旧块的编号，让残留 posting 挂到错误的文本上。`AUTOINCREMENT` 保证编号单调不复用。代价是多一张 `sqlite_sequence`。
 
 迁移用 `PRAGMA user_version` 打版本号：版本不符就丢弃重建，不走 `ALTER TABLE`。
 
@@ -224,10 +226,12 @@ detail 形如 `图片中文字: …片段…` 或 `第 3 页: …片段…`。
 
 ```sh
 "build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/hit.png --query 收据
-"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/settings.png --state settings --settings-scroll content
+"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/settings.png --state settings --settings-scroll 0.3
 ```
 
 前者出内容命中界面，后者出设置分区。省掉一处公开库改动。
+
+`--settings-scroll` 收的是 **0…1 的滚动比例**，不是分区名（`Snapshot.swift:130` 用 `Double(value)` 解析，传分区名会报 `Invalid settings scroll fraction`）；内容分区在 AI 话题之后，先取 `0.3`，看不全再调大。
 
 ### 测试（放 `Tests/OilFindUITests`，代码在 `OilFindApp` 内）
 
@@ -281,5 +285,5 @@ python3 Tests/Scripts/test_open_core.py
 
 scripts/build-app.sh --debug
 "build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/hit.png --query 收据
-"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/settings.png --state settings --settings-scroll content
+"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/settings.png --state settings --settings-scroll 0.3
 ```

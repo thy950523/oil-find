@@ -1546,11 +1546,12 @@ import OilFindCore
 
 /// Publishes content matches as supplementary hits on file rows.
 final class ContentSearchProvider: SupplementarySearchProvider {
-    private let index: ContentIndex
+    private let index: ContentIndex?
     private let queue = DispatchQueue(label: "com.oiloil.find.content.search", qos: .userInitiated)
     var isEnabled = true
 
-    init(index: ContentIndex) { self.index = index }
+    /// Optional so a disabled manager can exist without opening a database.
+    init(index: ContentIndex?) { self.index = index }
 
     /// The literals the user actually typed, ignoring filters such as `ext:` and `kind:`.
     /// Searching `raw` would ask the content index for the literal string "ext:pdf 发票".
@@ -1576,6 +1577,7 @@ final class ContentSearchProvider: SupplementarySearchProvider {
         guard !text.isEmpty else { return { [] } }
         let captured = sources
         return { [index] in
+            guard let index else { return [] }
             guard let found = try? index.search(text, limit: 200, isCancelled: isCancelled), !found.isEmpty else { return [] }
             if isCancelled() { return [] }
             var hits: [SupplementaryHit] = []
@@ -1748,8 +1750,10 @@ git commit -m "feat(content): multiplex the single supplementary provider slot"
 **Files:**
 - Create: `Sources/OilFindApp/ContentSearch/ContentManager.swift`
 - Create: `Sources/OilFindApp/ContentSearch/ContentSettings.swift`
-- Modify: `Sources/OilFindApp/AppDelegate.swift:59-71`
-- Modify: `Sources/OilFindApp/SettingsWindow.swift:368-369`
+- Modify: `Sources/OilFindApp/ContentSearch/ContentIndex.swift`（加 `clear()`）
+- Modify: `Sources/OilFindApp/ContentSearch/ContentSearchProvider.swift`（索引改可选已在 Task 9 完成，此处只核对）
+- Modify: `Sources/OilFindApp/AppDelegate.swift:20,59,134,200,276`
+- Modify: `Sources/OilFindApp/SettingsWindow.swift:7,368-369`
 - Modify: `Sources/OilFindApp/L10n.swift`
 - Test: `Tests/OilFindUITests/ContentSettingsTests.swift`
 
@@ -1791,9 +1795,148 @@ Expected: 编译失败
 
 **Step 3: 实现**
 
-`ContentManager`：持有一个写连接、一个只读连接、`ContentIndexer`、`ContentSearchProvider`，用 `@Published` 暴露 `enabled` / `indexing` / `count` / `diskBytes` / `failed`，照 `AITopicManager` 的骨架写。`start()` / `stop()` / `languageDidChange` 与 `AITopicManager` 同名同义。
+先在 `ContentIndex.swift` 补一个清空方法。`chunks` 上的 `ON DELETE CASCADE` 加上 `chunk_postings_delete` 触发器，删 `files` 就会把块与 FTS 行一并带走，不需要单独删：
 
-`L10n.swift` 按现有格式加键（中英对照）：
+```swift
+/// Drops every indexed file. Chunks and their postings go with them through the cascade
+/// and the `chunk_postings_delete` trigger, so this is the only statement needed.
+func clear() throws { try sql.run("DELETE FROM files") }
+```
+
+`ContentSearchProvider` 的索引改为可选，好让未启用的 manager 不必打开数据库（同时改 Task 9 的实现与它的 `guard`）：
+
+```swift
+    private let index: ContentIndex?
+    init(index: ContentIndex?) { self.index = index }
+    // inside prepareSearch's returned closure:
+    guard let index else { return [] }
+    guard let found = try? index.search(...), !found.isEmpty else { return [] }
+```
+
+新建 `Sources/OilFindApp/ContentSearch/ContentManager.swift`：
+
+```swift
+import Combine
+import Foundation
+import OilFindCore
+
+/// Owns the content index, its background indexer and the search provider. Mirrors
+/// `AITopicManager`'s shape so the settings window can observe one object.
+final class ContentManager: ObservableObject {
+    static let enabledKey = "contentSearchEnabled"
+
+    @Published private(set) var enabled: Bool
+    @Published private(set) var indexing = false
+    @Published private(set) var count = 0
+    @Published private(set) var diskBytes: Int64 = 0
+    @Published private(set) var failed = 0
+
+    let provider: ContentSearchProvider
+
+    /// Supplies the host's file index. `AppDelegate` installs it before the first `start()`.
+    /// Returns nil while the index is still loading, which makes `start()` a no-op.
+    var storeProvider: (() -> IndexStore?)?
+
+    private let defaults: UserDefaults
+    private let indexURL: URL?
+    private let store: ContentIndex?
+    private let indexer: ContentIndexer?
+    private let queue = DispatchQueue(label: "com.oiloil.find.content.index", qos: .utility)
+    private let lock = NSLock()
+    private var generation = 0
+    private var cancelled = false
+
+    /// `indexURL: nil` is fully inert: no database is opened and nothing is written to disk.
+    /// Tests use it so they never touch the user's real Application Support folder.
+    init(defaults: UserDefaults = .standard, indexURL: URL? = ContentIndex.defaultURL) {
+        self.defaults = defaults
+        self.indexURL = indexURL
+        let store = indexURL.flatMap { try? ContentIndex(url: $0) }
+        self.store = store
+        self.indexer = store.map { ContentIndexer(index: $0, parsers: [TextParser(), ImageOCRParser()]) }
+        let enabled = defaults.bool(forKey: Self.enabledKey)
+        self.enabled = enabled
+        self.provider = ContentSearchProvider(index: store)
+        self.provider.isEnabled = enabled
+        refresh()
+    }
+
+    func setEnabled(_ value: Bool) {
+        enabled = value
+        provider.isEnabled = value
+        defaults.set(value, forKey: Self.enabledKey)
+        if value { start() } else { stop() }
+    }
+
+    /// Called by `AppDelegate` when the host index changes. Content indexing is expensive, so
+    /// bursts are coalesced: a run only starts when nothing is already in flight.
+    func fileIndexChanged() { if !indexing { start() } }
+
+    func start() {
+        guard enabled, let indexer, storeProvider?() != nil else { return }
+        // Bump the generation before the run so a concurrent `stop()` can invalidate it.
+        lock.lock(); generation += 1; let mine = generation; cancelled = false; lock.unlock()
+        indexing = true
+        let provider = storeProvider
+        queue.async { [weak self] in
+            guard let self else { return }
+            let isCancelled = { self.isCancelled(mine) }
+            var hardFailure = false
+            // The store can disappear between the guard above and this hop; finish the run
+            // rather than returning early, or `indexing` would stay stuck on.
+            if let store = provider?() {
+                do { try indexer.synchronize(store: store, isCancelled: isCancelled) }
+                catch { hardFailure = true }
+            }
+            let failed = indexer.failedCount + (hardFailure ? 1 : 0)
+            let count = (try? self.store?.count()) ?? 0
+            DispatchQueue.main.async {
+                guard !self.isCancelled(mine) else { return }
+                self.indexing = false
+                self.failed = failed
+                self.count = count
+                self.diskBytes = Self.diskBytes(at: self.indexURL)
+            }
+        }
+    }
+
+    /// Invalidates the in-flight run. The worker checks `isCancelled` between files and stops.
+    func stop() { lock.lock(); generation += 1; cancelled = true; lock.unlock() }
+
+    func rebuild() { stop(); try? store?.clear(); refresh(); start() }
+    func clear() { stop(); try? store?.clear(); refresh() }
+
+    private func refresh() {
+        count = (try? store?.count()) ?? 0
+        diskBytes = Self.diskBytes(at: indexURL)
+    }
+
+    private func isCancelled(_ mine: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled || mine != generation
+    }
+
+    private static func diskBytes(at url: URL?) -> Int64 {
+        guard let url else { return 0 }
+        return [url.path, url.path + "-wal", url.path + "-shm"].reduce(0) { total, path in
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+            return total + ((attributes?[.size] as? NSNumber)?.int64Value ?? 0)
+        }
+    }
+}
+```
+
+`SettingsModel.swift`（`Sources/OilFindApp/SettingsWindow.swift:7`）加一个属性，让它能观察 manager，同时不影响现有 8 处构造点：
+
+```swift
+    let contentSearch: ContentManager
+    // in init(...), after `self.topics = topics`:
+    self.contentSearch = contentSearch ?? ContentManager(defaults: preferences, indexURL: nil)
+```
+
+`init` 头部加参数（放在 `topics:` 之后）：`contentSearch: ContentManager? = nil`。默认给一个不碰磁盘的 manager，所以 `snapshot: true` 的构造点与测试都不用改。
+
+`L10n.swift` 键加进现有 `strings` 字典（中英对照）：
 
 ```swift
 "contentTitle": ("文件内容", "File contents"),
@@ -1805,12 +1948,43 @@ Expected: 编译失败
 "contentClear": ("清除索引", "Clear index"),
 ```
 
-`AppDelegate.swift:59` 改接线：
+`ContentSettings.swift`：照 `AITopicSettings(manager:)` 的写法，`@ObservedObject var manager: ContentManager`。内容依次为总开关、`contentPrivacy` 说明文字、索引状态、磁盘占用、两个按钮。`enabled` 是 `private(set)`，不能直接绑，用显式 binding：
 
 ```swift
-panel.searchController.supplementaryProvider = SupplementaryMultiplexer(
-    providers: [contentSearch.provider] + [appExtension?.supplementarySearchProvider].compactMap { $0 })
+Toggle(L10n.text("contentEnabled"), isOn: Binding(
+    get: { manager.enabled },
+    set: { manager.setEnabled($0) }))
+Text(manager.indexing ? L10n.text("contentBuilding")
+                      : L10n.text("contentDone", "\(manager.count)"))
+Button(L10n.text("contentRebuild")) { manager.rebuild() }
+Button(L10n.text("contentClear")) { manager.clear() }
 ```
+
+失败数在 `manager.failed > 0` 时附一行。中英文跟随父视图重绘（父视图观察 `model`），所以不需要额外传 `chinese:`。
+
+`AppDelegate.swift` 接线（三处）：
+
+1. 第 20 行附近加属性，与 `topics` 并列：`private let contentSearch = ContentManager()`
+2. `startIndex(limited:)` 里，在 `self.manager = manager` 之后装来源并提供初值；第 59 行改为多路复用器：
+
+```swift
+        self.manager = manager; panel.searchController.manager = manager
+        contentSearch.storeProvider = { [weak manager] in manager?.store }
+        contentSearch.start()
+        panel.searchController.supplementaryProvider = SupplementaryMultiplexer(
+            providers: [contentSearch.provider] + [appExtension?.supplementarySearchProvider].compactMap { $0 })
+```
+
+3. 第 134 行 `onIndexChange` 追加内容索引的触发；第 200 行 `SettingsModel(...)` 传 `contentSearch: contentSearch`；`applicationWillTerminate` 里 `topics.stop()` 旁边加 `contentSearch.stop()`：
+
+```swift
+        manager.onIndexChange = { [weak self] in
+            self?.panel.searchController.indexChanged()
+            self?.contentSearch.fileIndexChanged()
+        }
+```
+
+不要调用 `languageDidChange`：`ContentManager` 没有语言相关状态，文案在视图里读 `L10n`，语言切换由父视图重绘覆盖。
 
 `SettingsWindow.swift:368-369` 之后插入：
 
@@ -1839,18 +2013,29 @@ Expected: 全部通过。注意 `OILFIND_FREE=1` 下内容搜索仍在（它是�
 
 ```sh
 scripts/build-app.sh --debug
-"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/content-settings.png --state settings --settings-scroll content
+"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/content-settings.png --state settings --settings-scroll 0.3
 "build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/content-hit.png --query 发票
 ```
 
 Expected: 第一张能看到内容分区；第二张能看到命中行带 detail 和高亮。
 
+注意 `--settings-scroll` 收的是 **0…1 的滚动比例**，不是分区名（`Snapshot.swift:130` 用 `Double(value)` 解析，传字符串会报 `Invalid settings scroll fraction`）。内容分区在 AI 话题之后，具体取多少要看实际布局，先用 `0.3`，看不全就调大。
+
 **Step 7: 提交**
 
 ```sh
-git add -A
+git add Sources/OilFindApp/ContentSearch/ContentManager.swift \
+        Sources/OilFindApp/ContentSearch/ContentSettings.swift \
+        Sources/OilFindApp/ContentSearch/ContentIndex.swift \
+        Sources/OilFindApp/ContentSearch/ContentSearchProvider.swift \
+        Sources/OilFindApp/AppDelegate.swift \
+        Sources/OilFindApp/SettingsWindow.swift \
+        Sources/OilFindApp/L10n.swift \
+        Tests/OilFindUITests/ContentSettingsTests.swift
 git commit -m "feat(content): add content search manager, settings and wiring"
 ```
+
+不要用 `git add -A`：这个仓库不提交构建产物与本机索引，`Pro/` 也必须保持未跟踪。
 
 ---
 
