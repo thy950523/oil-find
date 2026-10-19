@@ -516,8 +516,9 @@ extension ContentIndex {
     /// absent row is new.
     ///
     /// `complete` is false when the candidate enumeration could not finish. `removed` is computed
-    /// only then from a complete snapshot: deleting on a partial one would wipe every file the
-    /// interrupted scan had not reached yet, so an incomplete enumeration deletes nothing.
+    /// only when `complete` is true, from a complete snapshot: deleting on a partial one would wipe
+    /// every file the interrupted scan had not reached yet, so an incomplete enumeration deletes
+    /// nothing.
     func plan(candidates: [ContentFileRecord], complete: Bool = true) throws -> SyncPlan {
         var result = SyncPlan()
         var seen = Set<String>()
@@ -539,16 +540,25 @@ extension ContentIndex {
         // Swift has `for ... where` but no `while ... where`, so the membership test lives in the
         // body. The stored paths absent from the snapshot are the files the file system dropped.
         let statement = try statement("SELECT path FROM files")
+        // `defer`, unlike `removeFiles(prefix:)`'s trailing reset, because nothing is written after
+        // this scan. Without it a throwing `step` leaves the statement busy, and `statement(_:)`
+        // then refuses to hand it out, silently disabling removal detection for the connection.
+        defer { sqlite3_reset(statement.handle) }
         while try step(statement) {
             let path = statement.text(0)
             if !seen.contains(path) { result.removed.append(path) }
         }
-        sqlite3_reset(statement.handle)
         return result
     }
 
-    /// Applies a plan. Deletions come first so a path that moved and was re-added in the same
-    /// snapshot cannot be removed after it was written.
+    /// Bounds the write lock to one batch of parses. `parse` can spend hundreds of milliseconds per
+    /// image, so one transaction over the whole plan would hold the lock across hours of work and
+    /// let the WAL grow without bound; a batch keeps a throw resumable, because earlier batches stay
+    /// committed, and avoids one fsync per file on a large first sync.
+    private static let applyChunkSize = 256
+
+    /// Applies a plan. Deletions come first, as the spec requires; `removed` is disjoint from
+    /// `added` and `changed` by construction, so the order is not load-bearing for correctness.
     ///
     /// A record whose parse returns nil keeps its existing row untouched: a transient failure
     /// (cancellation, a locked file) must not replace successfully indexed text with nothing, and
@@ -557,10 +567,24 @@ extension ContentIndex {
     /// array is a different answer: the file parsed and genuinely has no text, so its chunks are
     /// cleared and its new metadata is stored.
     func apply(_ plan: SyncPlan, parse: (ContentFileRecord) -> [ContentChunk]?) throws {
-        for path in plan.removed { try removeFile(path: path) }
-        for record in plan.added + plan.changed {
-            guard let chunks = parse(record) else { continue }
-            try store(file: record, chunks: chunks)
+        // Deletions do no parsing, so one transaction over the whole list is bounded by the delete
+        // count, matching `removeFiles(prefix:)`. `removeFile` probes before its own transaction, so
+        // no statement is active when this `BEGIN IMMEDIATE` runs.
+        try transaction { for path in plan.removed { try removeFile(path: path) } }
+        let records = plan.added + plan.changed
+        var start = records.startIndex
+        while start < records.endIndex {
+            // `index(_:offsetBy:limitedBy:)` rather than integer arithmetic, so the chunking stays
+            // correct if the collection type changes.
+            let end = records.index(start, offsetBy: Self.applyChunkSize, limitedBy: records.endIndex)
+                ?? records.endIndex
+            try transaction {
+                for record in records[start..<end] {
+                    guard let chunks = parse(record) else { continue }
+                    try store(file: record, chunks: chunks)
+                }
+            }
+            start = end
         }
     }
 }

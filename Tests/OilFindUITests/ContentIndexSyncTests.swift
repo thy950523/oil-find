@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import OilFindApp
 
 /// Incremental sync: the diff between a candidate snapshot of the file index and the rows the
@@ -16,6 +17,15 @@ final class ContentIndexSyncTests: XCTestCase {
     private func seed(_ path: String, size: Int64, mtime: Int64) throws {
         try index.store(file: .init(path: path, size: size, mtime: mtime, kind: 3, parser: "text"),
                         chunks: [.init(ordinal: 0, label: "第 1 行附近", text: "开具发票的日期")])
+    }
+
+    /// Local copy of `ContentIndexWriteTests.ftsRowCount`, which is private to that file. Reads the
+    /// postings table through the index's own connection so a leaked posting is observable.
+    private func ftsRowCount() throws -> Int {
+        let statement = try index.statement("SELECT COUNT(*) FROM chunk_fts")
+        defer { sqlite3_reset(statement.handle) }
+        guard try statement.next() else { return 0 }
+        return Int(statement.int(0))
     }
 
     func testDetectsNewChangedAndRemovedFiles() throws {
@@ -61,5 +71,53 @@ final class ContentIndexSyncTests: XCTestCase {
         // An empty array means the file parsed and has no text, so the old chunks go.
         XCTAssertEqual(try index.chunkCount(file: stored.id), 0)
         XCTAssertEqual(stored.record.size, 2)
+        // The chunk delete trigger must drop the postings too; a leaked posting would keep matching
+        // searches against text the file no longer contains.
+        XCTAssertEqual(try ftsRowCount(), 0)
+    }
+
+    func testRemovesPathsMissingFromACompleteSnapshot() throws {
+        try seed("/a/1.txt", size: 10, mtime: 100)
+        try seed("/a/2.txt", size: 10, mtime: 100)
+        let plan = try index.plan(candidates: [
+            .init(path: "/a/1.txt", size: 10, mtime: 100, kind: 3, parser: "text"),
+        ])
+        XCTAssertEqual(plan.removed, ["/a/2.txt"])
+        try index.apply(plan, parse: { _ in [] })
+        XCTAssertNil(try index.file(path: "/a/2.txt"))
+        XCTAssertEqual(try index.count(), 1)
+    }
+
+    func testApplyStoresAnAddedRecord() throws {
+        let record = ContentFileRecord(path: "/a/1.txt", size: 10, mtime: 100, kind: 3, parser: "text")
+        let plan = try index.plan(candidates: [record])
+        XCTAssertEqual(plan.added.map(\.path), ["/a/1.txt"])
+        try index.apply(plan, parse: { _ in
+            [.init(ordinal: 0, label: "第 1 行附近", text: "开具发票的日期")]
+        })
+        let stored = try XCTUnwrap(try index.file(path: "/a/1.txt"))
+        XCTAssertEqual(stored.record.size, 10)
+        XCTAssertEqual(try index.chunkCount(file: stored.id), 1)
+        XCTAssertEqual(try ftsRowCount(), 1)
+    }
+
+    /// `size` alone is not the identity: the stored mtime must be compared too, or a same-size edit
+    /// would be classified `unchanged` and never re-parsed.
+    func testClassifierTreatsAnMtimeOnlyChangeAsChanged() throws {
+        try seed("/a/1.txt", size: 10, mtime: 100)
+        let plan = try index.plan(candidates: [
+            .init(path: "/a/1.txt", size: 10, mtime: 200, kind: 3, parser: "text"),
+        ])
+        XCTAssertEqual(plan.changed.map(\.path), ["/a/1.txt"])
+    }
+
+    /// A parser change with identical size and mtime must also force a re-parse: a better parser
+    /// arriving must not be skipped because the file itself did not move.
+    func testClassifierTreatsAParserOnlyChangeAsChanged() throws {
+        try seed("/a/1.txt", size: 10, mtime: 100)
+        let plan = try index.plan(candidates: [
+            .init(path: "/a/1.txt", size: 10, mtime: 100, kind: 3, parser: "ocr"),
+        ])
+        XCTAssertEqual(plan.changed.map(\.path), ["/a/1.txt"])
     }
 }
