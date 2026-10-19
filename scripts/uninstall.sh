@@ -10,12 +10,12 @@ esac
 printf '%s\n' 'The following will be deleted:' \
     '/Applications/Oil Find.app' \
     "$HOME/Library/Application Support/Oil Find" \
-    'Settings: com.oiloil.find' \
     'Legacy authorization item: com.oiloil.find.trial'
 if [[ "$PURGE" == true ]]; then
-    printf '%s\n' 'Pro trial anchors will also be deleted.'
+    printf '%s\n' 'Settings (com.oiloil.find) and Pro evaluation anchors will also be deleted.'
 else
-    printf '%s\n' 'Pro trial anchors will be kept.'
+    printf '%s\n' 'Settings will be kept. Pass --purge to delete them as well.' \
+        'Pro evaluation anchors will be kept.'
 fi
 read -r -p 'Continue? [y/N] ' confirmation
 [[ "$confirmation" == y ]] || exit 0
@@ -36,20 +36,10 @@ if pgrep -x OilFind >/dev/null; then
 fi
 
 rm -rf "/Applications/Oil Find.app" "$HOME/Library/Application Support/Oil Find"
-# Retain both opt-in evaluation anchors across a normal reinstall.
-PRO_EVALUATION_START="$(defaults read com.oiloil.find proEvaluationStartedAt 2>/dev/null || true)"
-PRO_EVALUATION_SEEN="$(defaults read com.oiloil.find proEvaluationLastSeenAt 2>/dev/null || true)"
-PRO_EVALUATION_ENDED="$(defaults read com.oiloil.find proEvaluationEndedAt 2>/dev/null || true)"
-defaults delete com.oiloil.find >/dev/null 2>&1 || true
-if [[ "$PURGE" == false ]]; then
-    if [[ -n "$PRO_EVALUATION_START" && -n "$PRO_EVALUATION_SEEN" ]]; then
-        defaults write com.oiloil.find proEvaluationStartedAt -float "$PRO_EVALUATION_START"
-        defaults write com.oiloil.find proEvaluationLastSeenAt -float "$PRO_EVALUATION_SEEN"
-        if [[ -n "$PRO_EVALUATION_ENDED" ]]; then
-            defaults write com.oiloil.find proEvaluationEndedAt -float "$PRO_EVALUATION_ENDED"
-        fi
-    fi
-else
+# Settings are the user's, not ours: keep them unless --purge was asked for. The Pro trial
+# anchor goes with them, so a plain reinstall can never hand out a fresh trial.
+if [[ "$PURGE" == true ]]; then
+    defaults delete com.oiloil.find >/dev/null 2>&1 || true
     security delete-generic-password -s com.oiloil.find.pro.evaluation >/dev/null 2>&1 || true
 fi
 security delete-generic-password -s com.oiloil.find.trial >/dev/null 2>&1 || true

@@ -23,6 +23,8 @@ jobs:
         run: swift test
       - name: Check open core boundary
         run: python3 Tests/Scripts/test_open_core.py
+      - name: Check uninstall script
+        run: python3 Tests/Scripts/test_uninstall.py
       - name: Check packaged launch without developer resources
         run: |
           scripts/build-app.sh
