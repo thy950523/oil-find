@@ -1240,10 +1240,11 @@ struct TextParser: ContentParser {
     var extensions: Set<String> { ["txt", "md", "markdown", "csv", "tsv", "log"] }
 
     func parse(url: URL, budget: AITopicWorkBudget, isCancelled: () -> Bool) throws -> [ContentChunk] {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let size = (attributes?[.size] as? Int) ?? 0
-        guard size <= maximumBytes else { throw ContentParserError.tooLarge }
+        // Map first and check the mapped length. Reading the size from the file attributes would
+        // silently fall back to 0 when the attributes are unavailable, and the guard would then
+        // let a multi-gigabyte file through into `String(data:encoding:)`.
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard data.count <= maximumBytes else { throw ContentParserError.tooLarge }
         let text = try Self.decode(data)
         guard !text.isEmpty else { return [] }
 
@@ -1393,6 +1394,18 @@ final class ContentIndexerTests: XCTestCase {
         try indexer.synchronize(store: store(root: dir.path, names: ["", "bad.txt"], kinds: [1, 3]), isCancelled: { false })
         XCTAssertEqual(indexer.failedCount, 1)
     }
+
+    /// The batch loop must not skip the final partial batch. A tiny batch size keeps the test fast.
+    func testBatchingCoversEveryEntry() throws {
+        var names = [""], kinds: [UInt8] = [1]
+        for i in 0..<5 {
+            try Data("开具发票".utf8).write(to: dir.appendingPathComponent("n\(i).txt"))
+            names.append("n\(i).txt"); kinds.append(3)
+        }
+        let indexer = ContentIndexer(index: index, parsers: [TextParser()], batchSize: 2)
+        try indexer.synchronize(store: store(root: dir.path, names: names, kinds: kinds), isCancelled: { false })
+        XCTAssertEqual(try index.count(), 5)
+    }
 }
 ```
 
@@ -1419,10 +1432,12 @@ final class ContentIndexer {
     private(set) var failedCount = 0
 
     /// The store's read lock blocks index writes, so candidates are copied out in batches.
-    static let batchSize = 20_000
+    /// An instance property rather than a constant so a test can shrink it.
+    var batchSize = 20_000
 
-    init(index: ContentIndex, parsers: [ContentParser], budget: AITopicWorkBudget = AITopicWorkBudget(fraction: 0.10)) {
-        self.index = index; self.parsers = parsers; self.budget = budget
+    init(index: ContentIndex, parsers: [ContentParser], budget: AITopicWorkBudget = AITopicWorkBudget(fraction: 0.10),
+         batchSize: Int = 20_000) {
+        self.index = index; self.parsers = parsers; self.budget = budget; self.batchSize = batchSize
     }
 
     func synchronize(store: IndexStore, isCancelled: () -> Bool) throws {
@@ -1430,10 +1445,13 @@ final class ContentIndexer {
         var candidates: [ContentFileRecord] = []
         var complete = true
         var offset = 1
-        while offset < store.count {
+        while true {
             if isCancelled() { complete = false; break }
-            let batch = store.read { () -> [ContentFileRecord] in
-                let upper = min(store.count, offset + Self.batchSize)
+            // `store.count` is only read inside the lock: it grows while a scan runs, and reading
+            // it outside would race with the writer. The batch carries the total back out.
+            let (batch, total) = store.read { () -> ([ContentFileRecord], Int) in
+                let upper = min(store.count, offset + batchSize)
+                guard upper > offset else { return ([], store.count) }
                 var records: [ContentFileRecord] = []
                 records.reserveCapacity(upper - offset)
                 for i in offset..<upper where store.isLive(UInt32(i)) {
@@ -1444,11 +1462,14 @@ final class ContentIndexer {
                     records.append(ContentFileRecord(path: path, size: Int64(store.size(UInt32(i))),
                                                      mtime: Int64(store.mtime[i]), kind: kind, parser: parser.identifier))
                 }
-                return records
+                return (records, store.count)
             }
             candidates.append(contentsOf: batch)
-            offset += Self.batchSize
+            // Advance past the batch just read, then stop: checking before the read would skip the
+            // final partial batch.
+            offset += batchSize
             try budget.checkpoint(isCancelled: isCancelled)
+            guard offset < total else { break }
         }
         let plan = try index.plan(candidates: candidates, complete: complete)
         try index.apply(plan) { record in
