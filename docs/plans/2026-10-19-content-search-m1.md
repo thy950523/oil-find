@@ -726,6 +726,8 @@ Expected: 编译失败，`has no member 'search'`
 ```swift
 struct ContentHit {
     let path: String
+    /// File-index kind (3 = document, 4 = image); the provider uses it to decide thumbnails.
+    let kind: UInt8
     let label: String
     let snippet: String
     let highlights: [NSRange]
@@ -746,7 +748,7 @@ extension ContentIndex {
         guard !query.isEmpty else { return [] }
 
         let statement = try statement("""
-            SELECT c.id, f.path, c.ordinal, c.label, c.folded, c.bytes
+            SELECT c.id, f.path, f.kind, c.ordinal, c.label, c.folded, c.bytes
             FROM chunk_fts JOIN chunks c ON c.id = chunk_fts.rowid JOIN files f ON f.id = c.file
             WHERE chunk_fts MATCH ? ORDER BY rank
             """)
@@ -756,16 +758,17 @@ extension ContentIndex {
         while try statement.next() {
             if isCancelled() { return [] }
             // A NULL or unreadable body skips this row; it must not abort the whole query.
-            let stored = blob(statement, 4)
+            let stored = blob(statement, 5)
             guard !stored.isEmpty,
-                  let body = try? ContentCompression.unpack(stored, bytes: Int(statement.int(5))) else { continue }
+                  let body = try? ContentCompression.unpack(stored, bytes: Int(statement.int(6))) else { continue }
             let bytes = [UInt8](body)
             // The gram AND admits false positives; every term must also appear literally.
             guard needles.allSatisfy({ !Self.byteRanges(of: $0, in: bytes).isEmpty }) else { continue }
             let path = statement.text(1)
             let snippet = Self.snippet(text: String(decoding: bytes, as: UTF8.self), terms: terms)
             if let existing = best[path], existing.highlights.count >= snippet.highlights.count { continue }
-            best[path] = ContentHit(path: path, label: statement.text(3), snippet: snippet.text,
+            best[path] = ContentHit(path: path, kind: UInt8(truncatingIfNeeded: statement.int(2)),
+                                    label: statement.text(4), snippet: snippet.text,
                                     highlights: snippet.highlights)
             if best.count >= limit { break }
         }
@@ -1444,8 +1447,9 @@ final class ContentSearchProviderTests: XCTestCase {
     }
     override func tearDownWithError() throws { index = nil; try? FileManager.default.removeItem(at: dir) }
 
-    /// Index 0 is the root directory, so `paths` must be direct children of "/" ("/note.txt",
-    /// not "/note.txt"). `resolve(path:)` starts its walk at index 0 and needs the dir flag.
+    /// Builds a store whose root is "/": index 0 is the directory and every entry in `paths` is a
+    /// direct child, so pass "/note.txt", not "sub/note.txt". `resolve(path:)` walks down from
+    /// index 0, which must carry the dir flag and must be live.
     private func store(paths: [String]) -> IndexStore {
         var buffer = ScanBuffer()
         let names = [""] + paths.map { ($0 as NSString).lastPathComponent }
@@ -1548,11 +1552,28 @@ final class ContentSearchProvider: SupplementarySearchProvider {
 
     init(index: ContentIndex) { self.index = index }
 
+    /// The literals the user actually typed, ignoring filters such as `ext:` and `kind:`.
+    /// Searching `raw` would ask the content index for the literal string "ext:pdf 发票".
+    static func terms(from query: Query) -> String {
+        query.clauses
+            .flatMap { $0.alternatives }
+            .compactMap { atom -> String? in
+                guard !atom.negated else { return nil }
+                switch atom.matcher {
+                case .name(let needle, _), .fileName(let needle):
+                    return String(decoding: needle, as: UTF8.self)
+                default:
+                    return nil
+                }
+            }
+            .joined(separator: " ")
+    }
+
     func prepareSearch(_ query: Query, options: SearchOptions, sources: [SearchSource],
                        isCancelled: @escaping () -> Bool) -> () -> [SupplementaryHit] {
         guard isEnabled, !sources.isEmpty else { return { [] } }
-        let text = query.raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.count >= 1 else { return { [] } }
+        let text = Self.terms(from: query)
+        guard !text.isEmpty else { return { [] } }
         let captured = sources
         return { [index] in
             guard let found = try? index.search(text, limit: 200, isCancelled: isCancelled), !found.isEmpty else { return [] }
@@ -1561,6 +1582,8 @@ final class ContentSearchProvider: SupplementarySearchProvider {
             for source in captured {
                 // Resolve under one read lock so the stamped version matches the resolution.
                 let resolved = source.store.read { () -> (version: UInt64, rows: [(ContentHit, UInt32)]) in
+                    // Until the hash is built nothing resolves, and a hit without an entry id
+                    // would be dropped by the host anyway.
                     guard source.store.hashReady else { return (source.store.version, []) }
                     let rows = found.compactMap { hit -> (ContentHit, UInt32)? in
                         guard let id = source.store.resolve(path: hit.path), source.store.isLive(id) else { return nil }
@@ -1569,7 +1592,8 @@ final class ContentSearchProvider: SupplementarySearchProvider {
                     return (source.store.version, rows)
                 }
                 for (hit, id) in resolved.rows {
-                    hits.append(Self.makeHit(hit: hit, source: source, entryID: id, version: resolved.version))
+                    hits.append(ContentSearchProvider.makeHit(hit: hit, source: source, entryID: id,
+                                                              version: resolved.version))
                 }
             }
             return hits
@@ -1579,11 +1603,11 @@ final class ContentSearchProvider: SupplementarySearchProvider {
     private static func makeHit(hit: ContentHit, source: SearchSource, entryID: UInt32, version: UInt64) -> SupplementaryHit {
         let prefix = hit.label.isEmpty ? "" : hit.label + "："
         let detail = prefix + hit.snippet
+        // `highlights` are offsets inside `hit.snippet`; shift them past the label prefix.
         let offset = (prefix as NSString).length
         let ranges = hit.highlights.map { NSRange(location: $0.location + offset, length: $0.length) }
-        let isImage = (hit.path as NSString).pathExtension.lowercased() != "txt"
         return SupplementaryHit(sourceID: source.id, entryID: entryID, detail: detail,
-                                highlights: ranges, thumbnail: isImage, sourceVersion: version)
+                                highlights: ranges, thumbnail: hit.kind == 4, sourceVersion: version)
     }
 
     func sourcesDidChange(_ sources: [SearchSource]) { }
