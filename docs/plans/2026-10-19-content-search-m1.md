@@ -434,9 +434,29 @@ git commit -m "feat(content): add a versioned content index schema"
 
 **Files:**
 - Modify: `Sources/OilFindApp/ContentSearch/ContentIndex.swift`
+- Create: `Tests/OilFindUITests/ContentTestSupport.swift`
 - Test: `Tests/OilFindUITests/ContentIndexWriteTests.swift`
 
 **Step 1: 写失败测试**
+
+先把 WAL 边车清理抽成共用函数，Task 3/4/5 三个测试文件都要用，别抄三遍。新建 `Tests/OilFindUITests/ContentTestSupport.swift`：
+
+```swift
+import Foundation
+
+/// The database runs in WAL mode, so the sidecars are left behind if only the main file goes.
+func removeContentDatabase(_ url: URL) {
+    for suffix in ["", "-wal", "-shm"] {
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + suffix))
+    }
+}
+
+/// A fresh database URL in the temp directory, named so leftovers are easy to spot.
+func makeContentDatabaseURL() -> URL {
+    FileManager.default.temporaryDirectory
+        .appendingPathComponent("content-" + UUID().uuidString + ".sqlite")
+}
+```
 
 这些测试**不能用 `index.search`**——`search` 要到 Task 4 才有，用了 Task 3 就永远过不了自己那一步。改直接查 postings 表。
 
@@ -448,17 +468,11 @@ import SQLite3
 final class ContentIndexWriteTests: XCTestCase {
     private var url: URL!
     private var index: ContentIndex!
-    /// The database runs in WAL mode, so the sidecars are left behind if only the main file goes.
-    private func removeDatabase(_ url: URL) {
-        for suffix in ["", "-wal", "-shm"] {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + suffix))
-        }
-    }
     override func setUpWithError() throws {
-        url = FileManager.default.temporaryDirectory.appendingPathComponent("content-" + UUID().uuidString + ".sqlite")
+        url = makeContentDatabaseURL()
         index = try ContentIndex(url: url)
     }
-    override func tearDownWithError() throws { index = nil; removeDatabase(url) }
+    override func tearDownWithError() throws { index = nil; removeContentDatabase(url) }
 
     /// Reads the postings table through the index's own connection. `search` does not exist yet.
     private func ftsRowCount() throws -> Int {
@@ -663,7 +677,9 @@ Expected: PASS
 **Step 5: 提交**
 
 ```sh
-git add Sources/OilFindApp/ContentSearch/ContentIndex.swift Tests/OilFindUITests/ContentIndexWriteTests.swift
+git add Sources/OilFindApp/ContentSearch/ContentIndex.swift \
+        Tests/OilFindUITests/ContentIndexWriteTests.swift \
+        Tests/OilFindUITests/ContentTestSupport.swift
 git commit -m "feat(content): store files and chunks with cascade delete"
 ```
 
@@ -686,17 +702,11 @@ import XCTest
 final class ContentIndexSearchTests: XCTestCase {
     private var url: URL!
     private var index: ContentIndex!
-    /// The database runs in WAL mode, so the sidecars are left behind if only the main file goes.
-    private func removeDatabase(_ url: URL) {
-        for suffix in ["", "-wal", "-shm"] {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + suffix))
-        }
-    }
     override func setUpWithError() throws {
-        url = FileManager.default.temporaryDirectory.appendingPathComponent("content-" + UUID().uuidString + ".sqlite")
+        url = makeContentDatabaseURL()
         index = try ContentIndex(url: url)
     }
-    override func tearDownWithError() throws { index = nil; removeDatabase(url) }
+    override func tearDownWithError() throws { index = nil; removeContentDatabase(url) }
 
     private func add(_ path: String, chunks: [(Int, String, String)]) throws {
         let id = try index.upsert(file: .init(path: path, size: 1, mtime: 1, kind: 3, parser: "text"))
@@ -878,17 +888,11 @@ import XCTest
 final class ContentIndexSyncTests: XCTestCase {
     private var url: URL!
     private var index: ContentIndex!
-    /// The database runs in WAL mode, so the sidecars are left behind if only the main file goes.
-    private func removeDatabase(_ url: URL) {
-        for suffix in ["", "-wal", "-shm"] {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + suffix))
-        }
-    }
     override func setUpWithError() throws {
-        url = FileManager.default.temporaryDirectory.appendingPathComponent("content-" + UUID().uuidString + ".sqlite")
+        url = makeContentDatabaseURL()
         index = try ContentIndex(url: url)
     }
-    override func tearDownWithError() throws { index = nil; removeDatabase(url) }
+    override func tearDownWithError() throws { index = nil; removeContentDatabase(url) }
 
     func testDetectsNewChangedAndRemovedFiles() throws {
         try index.replaceChunks(file: try index.upsert(file: .init(path: "/a/1.txt", size: 1, mtime: 1, kind: 3, parser: "text")),
