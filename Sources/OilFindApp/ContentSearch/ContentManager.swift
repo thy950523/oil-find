@@ -32,6 +32,12 @@ final class ContentManager: ObservableObject {
     private let lock = NSLock()
     private var generation = 0
     private var cancelled = false
+    /// Set when a file-index change arrives while a pass is in flight, so the change is not lost.
+    /// Main-thread-only, exactly like `indexing`: `fileIndexChanged()` is delivered on the main
+    /// thread by `IndexManager` and the pass completion also hops back to it, so the two never
+    /// interleave. `generation`/`cancelled` need the lock instead because the worker thread reads
+    /// them, which this flag deliberately does not.
+    private var pendingChange = false
 
     /// `indexURL: nil` is completely lazy: no database is opened and no file is written. Tests pass
     /// nil so they never touch the user's real Application Support directory.
@@ -73,10 +79,12 @@ final class ContentManager: ObservableObject {
     }
 
     /// Called by `AppDelegate` whenever the file index changes. Content indexing is expensive, so
-    /// bursts are coalesced: while a pass is already in flight the new state is picked up by that
-    /// pass's next read, and starting a second one would only race it.
+    /// bursts are coalesced. A pass already in flight snapshotted the file index when it began, so a
+    /// change landing now is invisible to it and cannot simply be ignored: record it and let that
+    /// pass's completion start exactly one follow-up. Starting a second pass here would race the
+    /// first, and dropping the change would leave the new file unsearchable until the next change.
     func fileIndexChanged() {
-        guard !indexing else { return }
+        guard !indexing else { pendingChange = true; return }
         start()
     }
 
@@ -86,6 +94,10 @@ final class ContentManager: ObservableObject {
     func start() {
         guard enabled, let indexer, storeProvider?() != nil else { return }
         lock.lock(); generation += 1; let mine = generation; cancelled = false; lock.unlock()
+        // This pass reads the file index now, so any change that arrived before this point is
+        // covered by it. Drop the pending mark so it cannot later trigger a redundant follow-up,
+        // including one left over from a pass that `stop()` cancelled before its completion ran.
+        pendingChange = false
         indexing = true
         queue.async { [weak self] in
             guard let self else { return }
@@ -107,6 +119,13 @@ final class ContentManager: ObservableObject {
                 self.count = total
                 self.failed = failures
                 self.diskBytes = bytes
+                // A change that arrived while this pass ran was recorded instead of dropped. Clear
+                // the flag before starting the follow-up so it runs exactly once and cannot chain
+                // into a loop, and go through `start()` so the enabled/store guards still apply.
+                if self.pendingChange {
+                    self.pendingChange = false
+                    self.start()
+                }
             }
         }
     }

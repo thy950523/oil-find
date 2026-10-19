@@ -78,6 +78,12 @@ final class ContentIndexer {
             // retried on the next run instead of being stored as empty.
             guard !isCancelled() else { return nil }
             guard let parser = parser(for: record.path, kind: record.kind) else { return nil }
+            // Charge the CPU budget here, immediately before the expensive work. The checkpoint
+            // after each enumeration batch above only meters the cheap directory walk, so without
+            // this one OCR and PDF decoding run back to back and pin a core for the whole pass.
+            // `checkpoint` returns at once while the fraction is not exceeded, so it is free when
+            // there is headroom; it sleeps only once the thread has spent more than its share.
+            budget.checkpoint(isCancelled: isCancelled)
             do {
                 return try parser.parse(url: URL(fileURLWithPath: record.path),
                                         budget: budget, isCancelled: isCancelled)
