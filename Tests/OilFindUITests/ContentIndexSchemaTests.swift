@@ -49,6 +49,7 @@ final class ContentIndexSchemaTests: XCTestCase {
             INSERT INTO chunk_fts(rowid, grams) VALUES(1, 'abc');
             """)
         let sql = try AITopicSQL(url, readOnly: true)
+        XCTAssertEqual(try count("chunks", sql), 1)
         XCTAssertEqual(try count("chunk_fts", sql), 1)
         // Deleting the file must cascade to its chunks, and the AFTER DELETE trigger must clear the
         // posting through that cascade, which proves foreign_keys=ON and the trigger both hold.

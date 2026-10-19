@@ -87,16 +87,18 @@ final class ContentIndex {
         return version
     }
 
-    /// `BEGIN IMMEDIATE` returns `SQLITE_BUSY` as soon as another connection holds the write lock;
-    /// the wrapper's 1 s busy timeout does not help with that, so a second instance or an
-    /// `oilfind-cli` launch during a rebuild would fail to open the index at all. Retry briefly.
+    /// Each attempt already spends the wrapper's 1 s busy timeout before `BEGIN IMMEDIATE` returns
+    /// `SQLITE_BUSY`, so bound the retry by wall clock rather than an attempt count: a second
+    /// instance launched during a long rebuild must not freeze the caller. Non-BUSY errors rethrow
+    /// immediately.
     private func beginImmediate() throws {
-        for attempt in 1...10 {
+        let deadline = Date().addingTimeInterval(2)
+        while true {
             do {
                 try sql.run("BEGIN IMMEDIATE")
                 return
             } catch {
-                guard sqlite3_errcode(sql.db) == SQLITE_BUSY, attempt < 10 else { throw error }
+                guard sqlite3_errcode(sql.db) == SQLITE_BUSY, Date() < deadline else { throw error }
                 Thread.sleep(forTimeInterval: 0.3)
             }
         }
@@ -111,13 +113,18 @@ final class ContentIndex {
             }
             return
         }
-        // Neither pragma can run inside a transaction. A failed journal_mode change is reported by
-        // returning the current mode rather than by an error, so read the result row: on a network
-        // home directory WAL may be unavailable and indexing must still proceed, just with
-        // serialised readers and writers.
-        let journal = try sql.prepare("PRAGMA journal_mode=WAL")
-        usesWAL = (try journal.next()) && journal.text(0).lowercased() == "wal"
-        sqlite3_reset(journal.handle)
+        // Neither pragma can run inside a transaction. A failed journal_mode conversion is reported
+        // by returning the current mode, while a contended one raises SQLITE_BUSY because this
+        // pragma does not invoke the busy handler. Either way indexing must still proceed with
+        // serialised readers and writers, so record usesWAL instead of failing the open.
+        do {
+            let journal = try sql.prepare("PRAGMA journal_mode=WAL")
+            usesWAL = (try journal.next()) && journal.text(0).lowercased() == "wal"
+            sqlite3_reset(journal.handle)
+        } catch {
+            guard sqlite3_errcode(sql.db) == SQLITE_BUSY else { throw error }
+            usesWAL = false
+        }
         try sql.run("PRAGMA foreign_keys=ON")
         // BEGIN IMMEDIATE serialises two writable connections opening the same fresh database: the
         // loser waits, then re-probes the version below and skips the winner's rebuild.
