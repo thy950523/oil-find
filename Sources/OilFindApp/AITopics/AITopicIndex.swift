@@ -189,7 +189,7 @@ public final class AITopicIndex {
         // Query callers do not need cooperative indexing checkpoints.
         try! grams(text, query: query, checkpoint: nil)
     }
-    private static func grams(_ text: String, query: Bool = false, checkpoint: (() throws -> Void)?) throws -> String {
+    static func grams(_ text: String, query: Bool = false, checkpoint: (() throws -> Void)?) throws -> String {
         let scalars = text.unicodeScalars
         let count = scalars.count
         let shortQuery = query && count < 3
