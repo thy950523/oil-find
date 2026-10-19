@@ -82,6 +82,12 @@ Expected: 编译失败，`cannot find 'Compression' in scope`
 ```swift
 import Foundation
 
+/// Shared by every content search component. Defined here so Task 1 compiles on its own.
+enum ContentIndexError: Error, LocalizedError {
+    case database(String)
+    var errorDescription: String? { if case .database(let message) = self { return message }; return nil }
+}
+
 /// ZLIB for stored bodies, LZFSE for verification documents, matching the AI topic index.
 /// A leading byte records the codec so the format can change without a migration.
 enum Compression {
@@ -192,10 +198,7 @@ Expected: 编译失败，`cannot find 'ContentIndex' in scope`
 import Foundation
 import SQLite3
 
-enum ContentIndexError: Error, LocalizedError {
-    case database(String)
-    var errorDescription: String? { if case .database(let message) = self { return message }; return nil }
-}
+// `ContentIndexError` lives in ContentSearch/Support/Compression.swift (added in Task 1).
 
 struct ContentChunk {
     let ordinal: Int
