@@ -805,7 +805,7 @@ final class ContentIndexSyncTests: XCTestCase {
                                 chunks: [.init(ordinal: 0, label: "", text: "发票")])
         try index.replaceChunks(file: try index.upsert(file: .init(path: "/a/2.txt", size: 1, mtime: 1, kind: 3, parser: "text")),
                                 chunks: [.init(ordinal: 0, label: "", text: "发票")])
-        // 1.txt unchanged, 2.txt edited, 3.txt new, 1.txt's neighbour gone.
+        // 1.txt unchanged, 2.txt edited, 3.txt new; every indexed file is in the snapshot.
         let plan = try index.plan(candidates: [
             .init(path: "/a/1.txt", size: 1, mtime: 1, kind: 3, parser: "text"),
             .init(path: "/a/2.txt", size: 9, mtime: 9, kind: 3, parser: "text"),
@@ -857,9 +857,13 @@ extension ContentIndex {
             else { plan.changed.append(candidate) }
         }
         guard complete else { return plan }
+        // Swift has `for ... where` but not `while ... where`.
         let statement = try statement("SELECT path FROM files")
         defer { sqlite3_reset(statement.handle) }
-        while try statement.next() where !seen.contains(statement.text(0)) { plan.removed.append(statement.text(0)) }
+        while try statement.next() {
+            let path = statement.text(0)
+            if !seen.contains(path) { plan.removed.append(path) }
+        }
         return plan
     }
 
@@ -890,6 +894,7 @@ git commit -m "feat(content): diff file system snapshot against the index"
 ## Task 6: 图片 OCR 解析器
 
 **Files:**
+- Create: `Sources/OilFindApp/ContentSearch/Parsers/ContentParser.swift`
 - Create: `Sources/OilFindApp/ContentSearch/Parsers/ImageOCRParser.swift`
 - Test: `Tests/OilFindUITests/ImageOCRParserTests.swift`
 
@@ -901,14 +906,16 @@ import XCTest
 @testable import OilFindApp
 
 final class ImageOCRParserTests: XCTestCase {
+    // `lockFocus` / `unlockFocus` are deprecated on macOS 14; the drawing-handler initialiser is not.
     private func screenshot(_ text: String, size: NSSize = NSSize(width: 900, height: 260)) throws -> URL {
-        let image = NSImage(size: size)
-        image.lockFocus()
-        NSColor.white.setFill(); NSRect(origin: .zero, size: size).fill()
-        (text as NSString).draw(at: NSPoint(x: 40, y: 110),
-                                withAttributes: [.font: NSFont.systemFont(ofSize: 64), .foregroundColor: NSColor.black])
-        image.unlockFocus()
-        let rep = try XCTUnwrap(NSBitmapImageRep(data: image.tiffRepresentation!))
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor.white.setFill(); rect.fill()
+            (text as NSString).draw(at: NSPoint(x: 40, y: 110),
+                                    withAttributes: [.font: NSFont.systemFont(ofSize: 64),
+                                                     .foregroundColor: NSColor.black])
+            return true
+        }
+        let rep = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ocr-" + UUID().uuidString + ".png")
         try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: url)
         return url
