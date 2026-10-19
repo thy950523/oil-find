@@ -194,3 +194,117 @@ final class ContentIndex {
         return Int(statement.int(0))
     }
 }
+
+extension ContentIndex {
+    func file(path: String) throws -> (record: ContentFileRecord, id: Int64, revision: Int64)? {
+        let statement = try statement("SELECT id, size, mtime, kind, parser, revision FROM files WHERE path=?")
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([path])
+        guard try statement.next() else { return nil }
+        let record = ContentFileRecord(path: path, size: statement.int(1), mtime: statement.int(2),
+                                       kind: UInt8(truncatingIfNeeded: statement.int(3)), parser: statement.text(4))
+        return (record, statement.int(0), statement.int(5))
+    }
+
+    // Do not add a second `file(path:)` overload that differs only in return type:
+    // `try index.file(path: p)?.revision` would then be ambiguous, and the tests rely on it.
+    @discardableResult
+    func upsert(file record: ContentFileRecord) throws -> Int64 {
+        if let existing = try file(path: record.path) {
+            guard existing.record.size != record.size || existing.record.mtime != record.mtime
+                || existing.record.kind != record.kind || existing.record.parser != record.parser else {
+                return existing.id
+            }
+            let statement = try statement("UPDATE files SET size=?, mtime=?, kind=?, parser=?, revision=revision+1 WHERE id=?")
+            defer { sqlite3_reset(statement.handle) }
+            statement.bind([String(record.size), String(record.mtime), String(record.kind),
+                            record.parser, String(existing.id)])
+            _ = try statement.next()
+            return existing.id
+        }
+        let statement = try statement("INSERT INTO files(path,size,mtime,kind,parser) VALUES(?,?,?,?,?)")
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([record.path, String(record.size), String(record.mtime),
+                        String(record.kind), record.parser])
+        _ = try statement.next()
+        return sqlite3_last_insert_rowid(sql.db)
+    }
+
+    func replaceChunks(file id: Int64, chunks: [ContentChunk]) throws {
+        try transaction {
+            // The `chunk_postings_delete` trigger drops the matching postings.
+            let drop = try statement("DELETE FROM chunks WHERE file=?")
+            drop.bind([String(id)]); _ = try drop.next(); sqlite3_reset(drop.handle)
+            // The blob column is last so the text binds can use one `bind` call.
+            let insert = try statement("INSERT INTO chunks(file,ordinal,label,bytes,folded) VALUES(?,?,?,?,?)")
+            let fts = try statement("INSERT INTO chunk_fts(rowid,grams) VALUES(?,?)")
+            for chunk in chunks {
+                // Grams must come from the folded text: `AITopicIndex` builds document grams
+                // from folded text (AITopicIndex.swift:274) and folds the query before gramming
+                // it (:618), so gramming raw text here would make matches case-sensitive.
+                let foldedText = AITopicIndex.fold(chunk.text)
+                let folded = Data(foldedText.utf8)
+                let packed = ContentCompression.pack(folded, compact: true)
+                // `bytes` is the UNCOMPRESSED length: unpack decodes in one exact-size pass.
+                insert.bind([String(id), String(chunk.ordinal), chunk.label, String(folded.count)])
+                Self.bindBlob(packed, at: 5, into: insert)
+                _ = try insert.next()
+                let rowid = sqlite3_last_insert_rowid(sql.db)
+                sqlite3_reset(insert.handle)
+                let grams = try AITopicIndex.grams(foldedText, checkpoint: nil)
+                fts.bind([String(rowid), grams]); _ = try fts.next(); sqlite3_reset(fts.handle)
+            }
+        }
+    }
+
+    static func bindBlob(_ data: Data, at column: Int32, into statement: AITopicStatement) {
+        let bytes = [UInt8](data)
+        _ = bytes.withUnsafeBufferPointer {
+            sqlite3_bind_blob(statement.handle, column, $0.baseAddress, Int32($0.count),
+                              unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+    }
+
+    func chunkCount(file id: Int64) throws -> Int {
+        let statement = try statement("SELECT COUNT(*) FROM chunks WHERE file=?")
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([String(id)])
+        guard try statement.next() else { return 0 }
+        return Int(statement.int(0))
+    }
+
+    func removeFile(path: String) throws {
+        try transaction {
+            guard let existing = try file(path: path) else { return }
+            // Cascades to `chunks`, whose delete trigger drops the postings.
+            let drop = try statement("DELETE FROM files WHERE id=?")
+            drop.bind([String(existing.id)]); _ = try drop.next(); sqlite3_reset(drop.handle)
+        }
+    }
+
+    func removeFiles(prefix: String) throws {
+        let statement = try statement("SELECT path FROM files WHERE path LIKE ? ESCAPE '\\'")
+        let escaped = prefix.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
+        statement.bind([escaped + "%"])
+        var paths: [String] = []
+        while try statement.next() { paths.append(statement.text(0)) }
+        // Reset before writing: `BEGIN IMMEDIATE` while a SELECT is still active on this
+        // connection is the lock pattern this project has already been bitten by.
+        sqlite3_reset(statement.handle)
+        // One transaction for the whole prefix, so a failure cannot leave half a volume gone.
+        try transaction {
+            for path in paths { try removeFile(path: path) }
+        }
+    }
+
+    func transaction(_ work: () throws -> Void) throws {
+        if inTransaction { try work(); return }
+        try sql.run("BEGIN IMMEDIATE")
+        // Only mark the transaction open once BEGIN succeeded, or a failure leaves the flag stuck.
+        inTransaction = true
+        do { try work(); try sql.run("COMMIT") }
+        catch { try? sql.run("ROLLBACK"); inTransaction = false; throw error }
+        inTransaction = false
+    }
+}
