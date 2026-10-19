@@ -1,4 +1,6 @@
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import OilFindApp
 
@@ -52,6 +54,42 @@ final class ImageOCRParserTests: XCTestCase {
         return url
     }
 
+    /// Draws `text` onto a white canvas and writes it as a JPEG carrying an embedded thumbnail,
+    /// reproducing the camera-style files the downsample path exists for. A `CGImage` from
+    /// `NSBitmapImageRep` carries no EXIF, so orientation is not exercised here.
+    private func writeJPEGWithEmbeddedThumbnail(width: Int, height: Int, text: String,
+                                                fontSize: CGFloat, name: String) throws -> URL {
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+                                                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                                    isPlanar: false, colorSpaceName: .deviceRGB,
+                                                    bytesPerRow: 0, bitsPerPixel: 0))
+        let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: bitmap))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: width, height: height).fill()
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: fontSize),
+            .foregroundColor: NSColor.black,
+        ]
+        (text as NSString).draw(at: NSPoint(x: 60, y: CGFloat(height) / 2 - fontSize / 2),
+                                withAttributes: attributes)
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        let url = directory.appendingPathComponent(name)
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL,
+                                                                        UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(bitmap.cgImage),
+                                   [kCGImageDestinationEmbedThumbnail: true] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return url
+    }
+
+    /// Wraps a written image in a `CGImageSource` so the downsample helpers can be exercised directly.
+    private func source(for url: URL) throws -> CGImageSource {
+        try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+    }
+
     func testRecognizesChineseTextInAScreenshot() throws {
         try skipOnCI("Vision accuracy varies with the OS and language assets")
         let url = try writeImage(width: 1000, height: 320, text: "发票号码 12345", fontSize: 120, name: "invoice.png")
@@ -87,5 +125,47 @@ final class ImageOCRParserTests: XCTestCase {
         let chunks = try parser.parse(url: url, budget: budget, isCancelled: { false })
         XCTAssertFalse(chunks.isEmpty)
         XCTAssertTrue(try XCTUnwrap(chunks.first?.text).contains("发票"))
+    }
+
+    /// Asserts on the downsample itself rather than on the OCR result: `testDownsamplesVeryWideImages`
+    /// would also pass if the image reached Vision at full resolution. Fails if
+    /// `kCGImageSourceThumbnailMaxPixelSize` is dropped (the long edge stays at 4200) or if
+    /// `kCGImageSourceCreateThumbnailFromImageAlways` is dropped (a synthesised PNG has no embedded
+    /// thumbnail, so the call returns nil). Needs no Vision, so it runs on CI.
+    func testThumbnailClampsTheLongEdgeOfALargeImage() throws {
+        let url = try writeImage(width: 4200, height: 600, text: nil, fontSize: 0, name: "clamp.png")
+        let imageSource = try source(for: url)
+        XCTAssertEqual(try XCTUnwrap(ImageOCRParser.longEdge(of: imageSource)), 4200)
+        let thumbnail = try XCTUnwrap(ImageOCRParser.thumbnail(of: imageSource))
+        let longEdge = max(thumbnail.width, thumbnail.height)
+        XCTAssertLessThanOrEqual(CGFloat(longEdge), ImageOCRParser.maximumDimension)
+        // A real downsample, not an embedded thumbnail: a tiny result would be something Vision
+        // cannot read, which is the failure mode `kCGImageSourceCreateThumbnailFromImageAlways` guards.
+        XCTAssertGreaterThan(longEdge, 1000)
+    }
+
+    /// The trap the design calls out as most likely to ship unnoticed. A JPEG written with
+    /// `kCGImageDestinationEmbedThumbnail` carries a small (~160 px) embedded thumbnail, so without
+    /// `kCGImageSourceCreateThumbnailFromImageAlways`, `CGImageSourceCreateThumbnailAtIndex` returns
+    /// that tiny copy and OCR finds nothing. The PNG fixtures cannot catch this: they carry no
+    /// embedded thumbnail, so the same call returns nil instead of a small image. The text is 120 pt
+    /// rather than the 200 pt used elsewhere on purpose: at 200 pt Vision still reads the 160 px
+    /// thumbnail on this OS, which would let the test pass with the flag removed.
+    func testRecognizesTextWhenTheImageCarriesAnEmbeddedThumbnail() throws {
+        try skipOnCI("Vision accuracy varies with the OS and language assets")
+        let url = try writeJPEGWithEmbeddedThumbnail(width: 4200, height: 600, text: "发票 2026",
+                                                     fontSize: 120, name: "embedded.jpg")
+        let chunks = try parser.parse(url: url, budget: budget, isCancelled: { false })
+        XCTAssertFalse(chunks.isEmpty)
+        XCTAssertTrue(try XCTUnwrap(chunks.first?.text).contains("发票"))
+    }
+
+    /// A zero-byte `.png` is not an image and never will be, so it must parse as "no text" rather
+    /// than throw: throwing would count it as a failure on every sync forever, so the failed count a
+    /// user sees could never fall. Needs no Vision, so it runs on CI.
+    func testZeroByteImageProducesNoChunks() throws {
+        let url = directory.appendingPathComponent("empty.png")
+        try Data().write(to: url)
+        XCTAssertTrue(try parser.parse(url: url, budget: budget, isCancelled: { false }).isEmpty)
     }
 }
