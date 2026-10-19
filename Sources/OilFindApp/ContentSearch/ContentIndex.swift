@@ -54,6 +54,15 @@ final class ContentIndex {
     private let readOnly: Bool
     private var statements: [String: AITopicStatement] = [:]
 
+    /// Bounds the write lock to one batch of parses. `parse` can spend hundreds of milliseconds per
+    /// image, so one transaction over the whole plan would hold the lock across hours of work and
+    /// let the WAL grow without bound; a batch keeps a throw resumable, because earlier batches stay
+    /// committed, and avoids one fsync per file on a large first sync.
+    ///
+    /// An instance property rather than a constant so tests can shrink it and exercise the chunk
+    /// loop, including its final partial batch.
+    var applyChunkSize = 256
+
     init(url: URL, readOnly: Bool = false) throws {
         self.readOnly = readOnly
         if !readOnly {
@@ -551,12 +560,6 @@ extension ContentIndex {
         return result
     }
 
-    /// Bounds the write lock to one batch of parses. `parse` can spend hundreds of milliseconds per
-    /// image, so one transaction over the whole plan would hold the lock across hours of work and
-    /// let the WAL grow without bound; a batch keeps a throw resumable, because earlier batches stay
-    /// committed, and avoids one fsync per file on a large first sync.
-    private static let applyChunkSize = 256
-
     /// Applies a plan. Deletions come first, as the spec requires; `removed` is disjoint from
     /// `added` and `changed` by construction, so the order is not load-bearing for correctness.
     ///
@@ -576,7 +579,7 @@ extension ContentIndex {
         while start < records.endIndex {
             // `index(_:offsetBy:limitedBy:)` rather than integer arithmetic, so the chunking stays
             // correct if the collection type changes.
-            let end = records.index(start, offsetBy: Self.applyChunkSize, limitedBy: records.endIndex)
+            let end = records.index(start, offsetBy: applyChunkSize, limitedBy: records.endIndex)
                 ?? records.endIndex
             try transaction {
                 for record in records[start..<end] {

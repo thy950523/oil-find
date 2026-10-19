@@ -120,4 +120,37 @@ final class ContentIndexSyncTests: XCTestCase {
         ])
         XCTAssertEqual(plan.changed.map(\.path), ["/a/1.txt"])
     }
+
+    /// A chunk size that does not divide the record count leaves a final partial batch; the loop
+    /// must still write it. Assert the paths, not just the count: a loop that wrote the wrong
+    /// records would keep the count right.
+    func testApplyWritesEveryRecordAcrossAChunkRemainder() throws {
+        index.applyChunkSize = 2
+        let paths = (1...5).map { "/a/\($0).txt" }
+        let plan = try index.plan(candidates: paths.map {
+            ContentFileRecord(path: $0, size: 10, mtime: 100, kind: 3, parser: "text")
+        })
+        XCTAssertEqual(plan.added.count, 5)
+        try index.apply(plan, parse: { _ in
+            [.init(ordinal: 0, label: "第 1 行附近", text: "开具发票的日期")]
+        })
+        XCTAssertEqual(try index.count(), 5)
+        for path in paths { XCTAssertNotNil(try index.file(path: path), path) }
+    }
+
+    /// An exact multiple of the chunk size must not leave an empty trailing batch that skips the
+    /// last records, nor one that re-writes already-written ones.
+    func testApplyWritesEveryRecordWhenTheChunkSizeDividesExactly() throws {
+        index.applyChunkSize = 2
+        let paths = (1...4).map { "/a/\($0).txt" }
+        let plan = try index.plan(candidates: paths.map {
+            ContentFileRecord(path: $0, size: 10, mtime: 100, kind: 3, parser: "text")
+        })
+        XCTAssertEqual(plan.added.count, 4)
+        try index.apply(plan, parse: { _ in
+            [.init(ordinal: 0, label: "第 1 行附近", text: "开具发票的日期")]
+        })
+        XCTAssertEqual(try index.count(), 4)
+        for path in paths { XCTAssertNotNil(try index.file(path: path), path) }
+    }
 }
