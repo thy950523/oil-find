@@ -213,6 +213,10 @@ enum L10n {
         "settings.excluded": ("排除的文件夹", "Excluded Folders"),
         "settings.noExcluded": ("还没有排除任何文件夹", "No excluded folders yet"),
         "settings.addFolder": ("添加文件夹…", "Add Folder…"),
-        "settings.excludedHint": ("这些文件夹和里面的内容不会出现在搜索结果里。改动之后会自动重建索引。", "These folders and their contents never appear in results. The index rebuilds after changes.")
+        "settings.excludedHint": ("这些文件夹和里面的内容不会出现在搜索结果里。改动之后会自动重建索引。", "These folders and their contents never appear in results. The index rebuilds after changes."),
+        "settings.reset": ("重置", "Reset"),
+        "settings.resetHint": ("恢复所有设置为默认值。索引会在重启后按默认范围重建。", "Restore every setting to its default. The index rebuilds to the default scope after a restart."),
+        "settings.resetAll": ("清空所有配置…", "Clear All Settings…"),
+        "settings.resetConfirm": ("所有设置将恢复为默认值，应用会随即重启。已建立的索引会按默认范围重建。", "Every setting will return to its default and the app will restart. The existing index is rebuilt to the default scope."),
     ]
 }
