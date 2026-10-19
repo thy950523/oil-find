@@ -25,15 +25,18 @@ final class ContentIndexerTests: XCTestCase {
     }
 
     /// A parser that never touches the file system, so tests can build a store from a synthetic
-    /// scan buffer instead of creating every file. `throwingPaths` simulates a damaged file.
+    /// scan buffer instead of creating every file. `throwingPaths` simulates a damaged file;
+    /// `cancellingPaths` simulates the cancellation path, which must not be counted as a failure.
     private struct StubParser: ContentParser {
         var identifier = "stub"
         var kinds: Set<UInt8> = [3, 4]
         var extensions: Set<String> = ["*"]
         var text = "发票 收据"
         var throwingPaths: Set<String> = []
+        var cancellingPaths: Set<String> = []
 
         func parse(url: URL, budget: AITopicWorkBudget, isCancelled: () -> Bool) throws -> [ContentChunk] {
+            if cancellingPaths.contains(url.path) { throw ContentParserError.cancelled }
             if throwingPaths.contains(url.path) { throw ContentParserError.damaged }
             return [ContentChunk(ordinal: 0, label: "stub", text: text)]
         }
@@ -126,11 +129,51 @@ final class ContentIndexerTests: XCTestCase {
     }
 
     func testBatchingCoversEveryEntry() throws {
-        let entries = (0..<5).map { Entry(name: "note\($0).txt", kind: 3) }
+        // Four entries plus the synthetic root make five store rows, which is not a multiple of
+        // `batchSize`, so the loop's final partial batch is exercised. Five entries would make six
+        // rows, an exact multiple, and a loop that dropped the last batch would still pass.
+        let entries = (0..<4).map { Entry(name: "note\($0).txt", kind: 3) }
         let indexer = ContentIndexer(index: index, parsers: [StubParser()], batchSize: 2)
 
         try indexer.synchronize(store: makeStore(entries), isCancelled: { false })
 
-        XCTAssertEqual(try index.count(), 5)
+        XCTAssertEqual(try index.count(), 4)
+    }
+
+    func testCancelledEnumerationDeletesNothing() throws {
+        let indexer = ContentIndexer(index: index, parsers: [StubParser()], batchSize: 2)
+        let keepPath = directory.appendingPathComponent("keep.txt").path
+        try indexer.synchronize(store: makeStore([Entry(name: "a.txt", kind: 3),
+                                                  Entry(name: "keep.txt", kind: 3)]),
+                                isCancelled: { false })
+        XCTAssertEqual(try index.count(), 2)
+
+        // Cancel after the first batch. The candidate set then holds only a.txt, so `keep.txt` is
+        // absent from an enumeration that is incomplete: a plan built as if it were complete would
+        // delete it. Nothing may be deleted, and cancellation is not a parse failure.
+        var calls = 0
+        let cancelled = { () -> Bool in calls += 1; return calls > 1 }
+        try indexer.synchronize(store: makeStore([Entry(name: "a.txt", kind: 3),
+                                                  Entry(name: "b.txt", kind: 3),
+                                                  Entry(name: "c.txt", kind: 3)]),
+                                isCancelled: cancelled)
+
+        XCTAssertEqual(try index.count(), 2)
+        XCTAssertNotNil(try index.file(path: keepPath))
+        XCTAssertEqual(indexer.failedCount, 0)
+    }
+
+    func testParserCancellationIsNotCountedAsAFailure() throws {
+        // The dedicated `catch ContentParserError.cancelled` returns nil before the generic catch,
+        // so a cancelled parse leaves the file to be retried without raising `failedCount`.
+        let path = directory.appendingPathComponent("note.txt").path
+        let indexer = ContentIndexer(index: index, parsers: [StubParser(cancellingPaths: [path])])
+
+        try indexer.synchronize(store: makeStore([Entry(name: "note.txt", kind: 3)]),
+                                isCancelled: { false })
+
+        XCTAssertEqual(indexer.failedCount, 0)
+        XCTAssertNil(try index.file(path: path))
+        XCTAssertEqual(try index.count(), 0)
     }
 }

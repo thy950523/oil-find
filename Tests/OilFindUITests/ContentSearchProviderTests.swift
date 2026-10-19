@@ -67,18 +67,33 @@ final class ContentSearchProviderTests: XCTestCase {
         XCTAssertEqual(hits.first?.sourceVersion, store.version)
     }
 
+    func testTermsIgnoreFilters() throws {
+        // `terms(from:)` must return the literals the user typed, not the raw query: searching the
+        // content index for "ext:pdf 发票" would match nothing.
+        let terms = ContentSearchProvider.terms(from: Query.parse("ext:pdf 发票"))
+
+        XCTAssertEqual(terms, "发票")
+        XCTAssertNotEqual(terms, "ext:pdf 发票")
+    }
+
     func testHitStillPointsAtTheSameFileAfterCompaction() throws {
-        let store = makeStore(["a.txt", "note.txt"])
+        let store = makeStore(["a.txt", "b.txt", "note.txt"])
         try addContent("/note.txt")
         let provider = ContentSearchProvider(index: index)
 
-        // Tombstone the entry in front of the target, then renumber. A provider that cached an
-        // entryID at index time would now point at a different file (or off the end).
+        // Before compaction the target sits at entry 3. A provider that cached that id (or returned a
+        // constant one) would land on a different file, or off the end, once the entry in front is
+        // tombstoned and the ids renumber.
+        let before = try XCTUnwrap(search(provider, store).first)
+        XCTAssertEqual(before.entryID, 3)
+        XCTAssertEqual(store.path(before.entryID), "/note.txt")
+
         store.write { _ = store.remove(1) }
         let compacted = store.write { store.compacted() }
         let hits = search(provider, compacted)
 
         let hit = try XCTUnwrap(hits.first)
+        XCTAssertNotEqual(hit.entryID, before.entryID)
         XCTAssertEqual(compacted.path(hit.entryID), "/note.txt")
         XCTAssertTrue(compacted.isLive(hit.entryID))
     }
