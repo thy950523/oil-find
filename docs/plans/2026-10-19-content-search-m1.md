@@ -47,12 +47,34 @@ import XCTest
 @testable import OilFindApp
 
 final class ContentSearchSupportTests: XCTestCase {
+    private func roundTrip(_ data: Data) throws {
+        for compact in [false, true] {
+            let packed = ContentCompression.pack(data, compact: compact)
+            XCTAssertEqual(try ContentCompression.unpack(packed, bytes: data.count), data)
+        }
+    }
     func testCompressionRoundTrips() throws {
         for text in ["", "收据", String(repeating: "开具发票的日期 ", count: 5000),
                      String((0..<4096).map { _ in Character(UnicodeScalar(UInt8.random(in: 32...126))) })] {
-            let raw = Data(text.utf8)
-            XCTAssertEqual(try Compression.unpack(Compression.pack(raw)), raw)
+            try roundTrip(Data(text.utf8))
         }
+    }
+    func testCompressibleInputActuallyCompresses() throws {
+        let raw = Data(String(repeating: "开具发票的日期 ", count: 5000).utf8)
+        XCTAssertLessThan(ContentCompression.pack(raw, compact: true).count, raw.count)
+    }
+    func testIncompressibleInputFallsBackToRaw() throws {
+        // Random bytes cannot shrink, so pack must store them verbatim behind the raw codec.
+        let raw = Data((0..<4096).map { _ in UInt8.random(in: 0...255) })
+        let packed = ContentCompression.pack(raw, compact: true)
+        XCTAssertEqual(packed.first, 0)
+        XCTAssertEqual(Data(packed.dropFirst()), raw)
+    }
+    func testDamagedBodiesThrow() throws {
+        XCTAssertThrowsError(try ContentCompression.unpack(Data(), bytes: 4))           // no codec byte
+        XCTAssertThrowsError(try ContentCompression.unpack(Data([9, 1, 2]), bytes: 4))  // unknown codec
+        XCTAssertThrowsError(try ContentCompression.unpack(Data([2, 1, 2]), bytes: 4))  // truncated zlib
+        XCTAssertThrowsError(try ContentCompression.unpack(Data([0, 1, 2]), bytes: 4))  // raw length mismatch
     }
     func testGramCheckpointIsCalledAndCancellationPropagates() throws {
         var calls = 0
@@ -88,45 +110,55 @@ enum ContentIndexError: Error, LocalizedError {
     var errorDescription: String? { if case .database(let message) = self { return message }; return nil }
 }
 
-/// ZLIB for stored bodies, LZFSE for verification documents, matching the AI topic index.
-/// A leading byte records the codec so the format can change without a migration.
-enum Compression {
-    private enum Codec: UInt8 { case raw = 0, zlib = 1, lzfse = 2 }
+/// Body compression for the content index.
+///
+/// The byte layout is deliberately identical to `AITopicIndex.pack` — a leading codec byte
+/// (0 raw, 1 LZFSE, 2 ZLIB) followed by the payload — but this is a separate implementation.
+/// The AI topic decoder writes into a reusable buffer to avoid allocating on its search path,
+/// which is not worth sharing here. Callers store the uncompressed length next to the body, so
+/// decoding is a single exact-size pass and needs no growth guessing.
+enum ContentCompression {
+    private enum Codec: UInt8 { case raw = 0, lzfse = 1, zlib = 2 }
 
     static func pack(_ data: Data, compact: Bool = false) -> Data {
-        guard !data.isEmpty else { return Data([Codec.raw.rawValue]) }
-        var output = Data(count: data.count)
-        let written = output.withUnsafeMutableBytes { destination in
-            data.withUnsafeBytes { source in
-                compression_encode_buffer(destination.bindMemory(to: UInt8.self).baseAddress!, output.count,
-                                          source.bindMemory(to: UInt8.self).baseAddress!, data.count, nil,
-                                          compact ? COMPRESSION_ZLIB : COMPRESSION_LZFSE)
+        let capacity = data.count
+        guard capacity > 0 else { return Data([Codec.raw.rawValue]) }
+        var output = Data(count: capacity)
+        let written = output.withUnsafeMutableBytes { destination -> Int in
+            data.withUnsafeBytes { source -> Int in
+                guard let out = destination.bindMemory(to: UInt8.self).baseAddress,
+                      let input = source.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                return compression_encode_buffer(out, capacity, input, capacity, nil,
+                                                 compact ? COMPRESSION_ZLIB : COMPRESSION_LZFSE)
             }
         }
-        guard written > 0, written < data.count else { return Data([Codec.raw.rawValue]) + data }
+        guard written > 0, written < capacity else { return Data([Codec.raw.rawValue]) + data }
         output.count = written
         return Data([(compact ? Codec.zlib : Codec.lzfse).rawValue]) + output
     }
 
-    static func unpack(_ data: Data) throws -> Data {
-        guard let codec = data.first.flatMap(Codec.init(rawValue:)) else { throw ContentIndexError.database("Empty compressed body") }
-        let body = data.dropFirst()
-        guard codec != .raw else { return Data(body) }
-        // The stored size is unknown; grow until the decoder stops reporting a short buffer.
-        var capacity = max(1024, body.count * 4)
-        while capacity <= 256 * 1024 * 1024 {
-            var output = Data(count: capacity)
-            let written = output.withUnsafeMutableBytes { destination in
-                body.withUnsafeBytes { source in
-                    compression_decode_buffer(destination.bindMemory(to: UInt8.self).baseAddress!, capacity,
-                                              source.bindMemory(to: UInt8.self).baseAddress!, body.count, nil,
-                                              codec == .zlib ? COMPRESSION_ZLIB : COMPRESSION_LZFSE)
-                }
-            }
-            if written > 0 && written < capacity { output.count = written; return output }
-            capacity *= 4
+    /// `bytes` is the uncompressed length stored alongside the body.
+    static func unpack(_ data: Data, bytes: Int) throws -> Data {
+        guard let codec = data.first.flatMap(Codec.init(rawValue:)) else {
+            throw ContentIndexError.database("Missing compression codec")
         }
-        throw ContentIndexError.database("Cannot decompress body")
+        let body = data.dropFirst()
+        if codec == .raw {
+            guard body.count == bytes else { throw ContentIndexError.database("Truncated raw body") }
+            return Data(body)
+        }
+        guard bytes > 0 else { throw ContentIndexError.database("Missing body length") }
+        var output = Data(count: bytes)
+        let written = output.withUnsafeMutableBytes { destination -> Int in
+            body.withUnsafeBytes { source -> Int in
+                guard let out = destination.bindMemory(to: UInt8.self).baseAddress,
+                      let input = source.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                return compression_decode_buffer(out, bytes, input, body.count, nil,
+                                                 codec == .zlib ? COMPRESSION_ZLIB : COMPRESSION_LZFSE)
+            }
+        }
+        guard written == bytes else { throw ContentIndexError.database("Cannot decompress body") }
+        return output
     }
 }
 ```
@@ -257,7 +289,7 @@ final class ContentIndex {
                 ordinal INTEGER NOT NULL,
                 label TEXT NOT NULL,
                 folded BLOB NOT NULL,
-                bytes INTEGER NOT NULL);
+                bytes INTEGER NOT NULL);   -- UNCOMPRESSED length of folded, so unpack is one exact pass
             CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file);
             CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(grams, content='', contentless_delete=1, detail=none);
             """)
@@ -409,22 +441,29 @@ extension ContentIndex {
         try transaction {
             let drop = try statement("DELETE FROM chunks WHERE file=?")
             drop.bind([String(id)]); _ = try drop.next(); sqlite3_reset(drop.handle)
-            let insert = try statement("INSERT INTO chunks(file,ordinal,label,folded,bytes) VALUES(?,?,?,?,?)")
+            // The blob column is last so the text binds can use one `bind` call.
+            let insert = try statement("INSERT INTO chunks(file,ordinal,label,bytes,folded) VALUES(?,?,?,?,?)")
             let fts = try statement("INSERT INTO chunk_fts(rowid,grams) VALUES(?,?)")
             for chunk in chunks {
                 let folded = Data(AITopicIndex.fold(chunk.text).utf8)
-                let packed = Compression.pack(folded, compact: true)
-                insert.bind([String(id), String(chunk.ordinal), chunk.label, ""])
+                let packed = ContentCompression.pack(folded, compact: true)
+                // `bytes` is the UNCOMPRESSED length: unpack decodes in one exact-size pass.
+                insert.bind([String(id), String(chunk.ordinal), chunk.label, String(folded.count)])
+                Self.bindBlob(packed, at: 5, into: insert)
                 _ = try insert.next()
                 let rowid = sqlite3_last_insert_rowid(sql.db)
                 sqlite3_reset(insert.handle)
-                let update = try statement("UPDATE chunks SET folded=?, bytes=? WHERE id=?")
-                update.bind([String(rowid), String(packed.count)])
-                sqlite3_bind_blob(update.handle, 1, [UInt8](packed), Int32(packed.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-                _ = try update.next(); sqlite3_reset(update.handle)
                 let grams = try AITopicIndex.grams(chunk.text, checkpoint: nil)
                 fts.bind([String(rowid), grams]); _ = try fts.next(); sqlite3_reset(fts.handle)
             }
+        }
+    }
+
+    static func bindBlob(_ data: Data, at column: Int32, into statement: AITopicStatement) {
+        let bytes = [UInt8](data)
+        _ = bytes.withUnsafeBufferPointer {
+            sqlite3_bind_blob(statement.handle, column, $0.baseAddress, Int32($0.count),
+                              unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         }
     }
 
@@ -584,7 +623,7 @@ extension ContentIndex {
         guard !query.isEmpty else { return [] }
 
         let statement = try statement("""
-            SELECT c.id, f.path, c.ordinal, c.label, c.folded
+            SELECT c.id, f.path, c.ordinal, c.label, c.folded, c.bytes
             FROM chunk_fts JOIN chunks c ON c.id = chunk_fts.rowid JOIN files f ON f.id = c.file
             WHERE chunk_fts MATCH ? ORDER BY rank
             """)
@@ -593,7 +632,9 @@ extension ContentIndex {
         var best: [String: ContentHit] = [:]
         while try statement.next() {
             if isCancelled() { return [] }
-            guard let folded = try Compression.unpack(blob(statement, 4)) else { continue }
+            // A NULL or unreadable body skips this row; it must not abort the whole query.
+            let stored = blob(statement, 4)
+            guard !stored.isEmpty, let folded = try? ContentCompression.unpack(stored, bytes: Int(statement.int(5))) else { continue }
             let bytes = [UInt8](folded)
             guard let ranges = Self.ranges(of: needle, in: bytes), !ranges.isEmpty else { continue }
             let path = statement.text(1)

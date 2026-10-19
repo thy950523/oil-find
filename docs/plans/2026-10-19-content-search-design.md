@@ -17,7 +17,7 @@
 | 复用对象 | 位置 |
 | --- | --- |
 | SQLite 封装 | `AITopics/AITopicSQL` |
-| ZLIB / LZFSE 压缩 | `AITopicIndex.swift:223-234`（`pack` / `decode`） |
+| ZLIB / LZFSE 压缩 | 格式对齐 `AITopicIndex.swift:223-234`（codec 字节 0 raw / 1 LZFSE / 2 ZLIB），但独立实现。AI 话题的解码器带复用缓冲区以避开搜索路径上的分配，共用会动到它的热路径，故不抽取 |
 | gram 生成 | `AITopicIndex.swift:188-220` |
 | CPU 预算 | `AITopics/AITopicWorkBudget.swift`（35 行，自包含） |
 | 文件监听 | `AITopics/AITopicFileWatcher.swift` |
