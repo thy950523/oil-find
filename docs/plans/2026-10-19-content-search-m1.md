@@ -23,9 +23,9 @@
 
 ```sh
 swift build
-swift test --filter ContentSearch
+swift test --filter Content
 OILFIND_FREE=1 swift build
-OILFIND_FREE=1 swift test --filter ContentSearch
+OILFIND_FREE=1 swift test --filter Content
 python3 Tests/Scripts/test_open_core.py
 ```
 
