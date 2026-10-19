@@ -8,6 +8,7 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var language: AppLanguage
     @Published var launchAtLogin: Bool
     let topics: AITopicManager
+    let contentSearch: ContentManager
     let update: UpdateManager
     private var languageObserver: NSObjectProtocol?
     private let languageDefaults: UserDefaults
@@ -48,8 +49,11 @@ final class SettingsModel: ObservableObject {
     private var keyMonitor: Any?
     private var timer: Timer?
 
-    init(snapshotStore: IndexStore? = nil, snapshot: Bool = false, languageDefaults: UserDefaults = .standard, preferences: UserDefaults = .standard, topics: AITopicManager? = nil) {
+    init(snapshotStore: IndexStore? = nil, snapshot: Bool = false, languageDefaults: UserDefaults = .standard, preferences: UserDefaults = .standard, topics: AITopicManager? = nil, contentSearch: ContentManager? = nil) {
         self.topics = topics ?? AITopicManager(defaults: preferences)
+        // The fallback opens no database: a `snapshot: true` construction and the tests pass no
+        // manager and must not touch the real content index.
+        self.contentSearch = contentSearch ?? ContentManager(defaults: preferences, indexURL: nil)
         self.snapshot = snapshot
         self.preferences = preferences
         self.languageDefaults = languageDefaults
@@ -364,6 +368,9 @@ private struct SettingsForm: View {
             }
             Section(L10n.text("topicsTitle")) {
                 AITopicSettings(manager: model.topics)
+            }
+            Section(L10n.text("contentTitle")) {
+                ContentSettings(manager: model.contentSearch)
             }
             if let appExtension { appExtension.settingsSection(window: window) }
             Section {

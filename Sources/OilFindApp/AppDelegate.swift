@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private let panel = SearchPanel()
     private let topics = AITopicManager()
+    private let contentSearch = ContentManager()
     private lazy var topicSearch = AITopicSearchProvider(manager: topics)
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
@@ -56,7 +57,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let modifiers = (defaults.object(forKey: "hotKeyModifiers") as? NSNumber)?.uint32Value ?? UInt32(cmdKey | shiftKey)
         hotKey = HotKey(keyCode: key, modifiers: modifiers) { [weak self] in self?.handleHotKey() }
         buildMenu(keyCode: key, modifiers: modifiers)
-        panel.searchController.supplementaryProvider = appExtension?.supplementarySearchProvider
         panel.searchController.additionalSearchProvider = topicSearch
         topics.start()
         panel.searchController.additionalSources = { [weak self] in (self?.externalDrives.searchSources() ?? []) + (self?.appExtension?.searchSources() ?? []) }
@@ -117,6 +117,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.limited = limited
         let manager = IndexManager(config: SettingsPreferences.indexConfig(limited: limited), dbURL: Self.dbURL)
         self.manager = manager; panel.searchController.manager = manager
+        // The supplementary slot is single and the app extension owns it, so wrap both providers
+        // instead of competing for it.
+        contentSearch.storeProvider = { [weak manager] in manager?.store }
+        contentSearch.start()
+        panel.searchController.supplementaryProvider = SupplementaryMultiplexer(
+            providers: [contentSearch.provider] + [appExtension?.supplementarySearchProvider].compactMap { $0 })
         settingsController?.model.manager = manager
         panel.searchController.setState(.indexing)
         panel.searchController.searchField.focus()
@@ -131,7 +137,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.panel.searchController.managerStateChanged(state)
             if state == .scanning && self.welcomeState?.isShowing != true { self.panel.show(source: .indexing) }
         }
-        manager.onIndexChange = { [weak self] in self?.panel.searchController.indexChanged() }
+        manager.onIndexChange = { [weak self] in
+            self?.panel.searchController.indexChanged()
+            self?.contentSearch.fileIndexChanged()
+        }
         manager.start()
     }
     private func buildMenu(keyCode: UInt32, modifiers: UInt32) {
@@ -197,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.hide(source: .settings)
         NSApp.activate(ignoringOtherApps: true)
         if settingsController == nil {
-            let model = SettingsModel(topics: topics); model.manager = manager
+            let model = SettingsModel(topics: topics, contentSearch: contentSearch); model.manager = manager
             model.suspendHotKey = { [weak self] in self?.hotKey?.unregister(); self?.hotKey = nil }
             model.registerHotKey = { [weak self] code, mask in self?.registerHotKey(keyCode: code, modifiers: mask) ?? false }
             model.onConfigChange = { [weak self] in
@@ -273,6 +282,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls { appExtension?.handle(url) }
     }
-    func applicationWillTerminate(_ notification: Notification) { if !secondaryInstance { topics.stop(); appExtension?.stop(); externalDrives.stop(); UpdateManager.shared.stop() }; settingsController?.model.stopRefreshing(); permissionTimer?.invalidate(); hotKey?.unregister(); manager?.stop() }
+    func applicationWillTerminate(_ notification: Notification) { if !secondaryInstance { topics.stop(); contentSearch.stop(); appExtension?.stop(); externalDrives.stop(); UpdateManager.shared.stop() }; settingsController?.model.stopRefreshing(); permissionTimer?.invalidate(); hotKey?.unregister(); manager?.stop() }
     deinit { if let languageObserver { NotificationCenter.default.removeObserver(languageObserver) } }
 }

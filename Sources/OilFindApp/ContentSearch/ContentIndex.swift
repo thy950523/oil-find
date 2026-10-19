@@ -362,6 +362,13 @@ extension ContentIndex {
         try transaction { for path in paths { try removeFile(path: path) } }
     }
 
+    /// Drops every indexed file. `chunks` cascades from `files` and the `chunk_postings_delete`
+    /// trigger drops the matching FTS rows, so this one statement is the whole operation: deleting
+    /// from `chunks` or `chunk_fts` separately would double up the work and can miss rows.
+    func clear() throws {
+        try run("DELETE FROM files")
+    }
+
     @discardableResult
     func transaction<T>(_ work: () throws -> T) throws -> T {
         // `sqlite3_get_autocommit` reports SQLite's own state, so unlike a separate flag it cannot
