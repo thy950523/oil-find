@@ -76,7 +76,9 @@ CREATE TABLE chunks(
 CREATE VIRTUAL TABLE chunk_fts USING fts5(grams, content='', contentless_delete=1, detail=none);
 ```
 
-原地迁移沿用 `AITopicIndex` 的做法：`columns()` 探测 + `ALTER TABLE`。
+迁移用 `PRAGMA user_version` 打版本号：版本不符就丢弃重建，不走 `ALTER TABLE`。
+
+`AITopicIndex` 用 `columns()` 探测 + `ALTER TABLE` 原地迁，是因为那里存的是用户的 AI 对话正文，丢了不可恢复。内容索引是**派生数据**，能从文件重建，所以版本不符直接重建更简单也更可靠——`ALTER TABLE` 只能补列，修复不了类型不符、缺 `UNIQUE`、`chunk_fts` 选项不对这类漂移。重建在同一个 `BEGIN IMMEDIATE` 事务里完成，两个写连接同时首次打开也只会有一次重建。
 
 ### 分块策略
 
