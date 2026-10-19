@@ -76,4 +76,98 @@ final class ContentIndexWriteTests: XCTestCase {
         XCTAssertTrue(try statement.next())
         XCTAssertEqual(statement.int(0), 1)
     }
+
+    func testStoreCommitsMetadataAndChunksTogether() throws {
+        let id = try index.store(file: .init(path: "/a/b.pdf", size: 10, mtime: 100, kind: 3, parser: "pdf"),
+                                 chunks: [.init(ordinal: 0, label: "第 1 页", text: "开具发票的日期")])
+        XCTAssertEqual(try index.file(path: "/a/b.pdf")?.revision, 1)
+        XCTAssertEqual(try index.file(path: "/a/b.pdf")?.record.size, 10)
+        XCTAssertEqual(try index.chunkCount(file: id), 1)
+        XCTAssertEqual(try ftsRowCount(), 1)
+    }
+
+    /// The metadata is written before the chunks, so a failure in the chunk write must roll the
+    /// file row back too; otherwise the stored mtime would make every later sync skip the file.
+    func testStoreRollsBackMetadataWhenChunkWriteFails() throws {
+        XCTAssertThrowsError(try index.store(
+            file: .init(path: "/a/b.pdf", size: 10, mtime: 100, kind: 3, parser: "pdf"),
+            chunks: [.init(ordinal: 0, label: "第 1 页", text: "开具发票"),
+                     .init(ordinal: 0, label: "第 1 页", text: "重复的序号")]))
+        XCTAssertNil(try index.file(path: "/a/b.pdf"))
+        XCTAssertEqual(try index.count(), 0)
+        XCTAssertEqual(try ftsRowCount(), 0)
+    }
+
+    func testRemoveFilesIsCaseSensitiveAndDoesNotOverMatch() throws {
+        for path in ["/Volumes/X/a.txt", "/Volumes/Xavier/b.txt", "/Volumes/x/c.txt"] {
+            try index.store(file: .init(path: path, size: 1, mtime: 1, kind: 3, parser: "text"),
+                            chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        }
+        try index.removeFiles(prefix: "/Volumes/X/")
+        // LIKE would have been case-insensitive and matched both of these.
+        XCTAssertNotNil(try index.file(path: "/Volumes/Xavier/b.txt"))
+        XCTAssertNotNil(try index.file(path: "/Volumes/x/c.txt"))
+        XCTAssertNil(try index.file(path: "/Volumes/X/a.txt"))
+        XCTAssertEqual(try index.count(), 2)
+        XCTAssertEqual(try ftsRowCount(), 2)
+    }
+
+    func testRemoveFilesTreatsWildcardCharactersLiterally() throws {
+        for path in ["/a/100%/f.txt", "/a/1000/f.txt", "/a/x_y/f.txt", "/a/xay/f.txt"] {
+            try index.store(file: .init(path: path, size: 1, mtime: 1, kind: 3, parser: "text"),
+                            chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        }
+        try index.removeFiles(prefix: "/a/100%/")
+        try index.removeFiles(prefix: "/a/x_y/")
+        XCTAssertNil(try index.file(path: "/a/100%/f.txt"))
+        XCTAssertNil(try index.file(path: "/a/x_y/f.txt"))
+        XCTAssertNotNil(try index.file(path: "/a/1000/f.txt"))
+        XCTAssertNotNil(try index.file(path: "/a/xay/f.txt"))
+    }
+
+    func testRemoveFilesWithEmptyPrefixIsANoOp() throws {
+        try index.store(file: .init(path: "/a/b.txt", size: 1, mtime: 1, kind: 3, parser: "text"),
+                        chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        try index.removeFiles(prefix: "")
+        XCTAssertEqual(try index.count(), 1)
+        XCTAssertEqual(try ftsRowCount(), 1)
+    }
+
+    func testRemoveFileOnAbsentPathIsANoOp() throws {
+        XCTAssertNoThrow(try index.removeFile(path: "/nope.txt"))
+        XCTAssertEqual(try index.count(), 0)
+    }
+
+    func testReplaceChunksRejectsDuplicateOrdinalsAndKeepsExistingChunks() throws {
+        let id = try index.store(file: .init(path: "/a/b.txt", size: 1, mtime: 1, kind: 3, parser: "text"),
+                                 chunks: [.init(ordinal: 0, label: "第 1 页", text: "开具发票")])
+        XCTAssertThrowsError(try index.replaceChunks(file: id, chunks: [
+            .init(ordinal: 0, label: "", text: "新内容"),
+            .init(ordinal: 0, label: "", text: "重复的序号"),
+        ]))
+        XCTAssertEqual(try index.chunkCount(file: id), 1)
+        XCTAssertEqual(try ftsRowCount(), 1)
+    }
+
+    func testReplaceChunksWithEmptyListDropsChunksAndPostings() throws {
+        let id = try index.store(file: .init(path: "/a/b.txt", size: 1, mtime: 1, kind: 3, parser: "text"),
+                                 chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        try index.replaceChunks(file: id, chunks: [])
+        XCTAssertEqual(try index.chunkCount(file: id), 0)
+        XCTAssertEqual(try ftsRowCount(), 0)
+        // Only the text goes; the file row itself stays.
+        XCTAssertNotNil(try index.file(path: "/a/b.txt"))
+    }
+
+    func testUpsertBumpsRevisionWhenKindOrParserChanges() throws {
+        let base = ContentFileRecord(path: "/a/b.pdf", size: 10, mtime: 100, kind: 3, parser: "pdf")
+        _ = try index.upsert(file: base)
+        _ = try index.upsert(file: .init(path: base.path, size: base.size, mtime: base.mtime,
+                                         kind: 4, parser: base.parser))
+        XCTAssertEqual(try index.file(path: base.path)?.revision, 2)
+        _ = try index.upsert(file: .init(path: base.path, size: base.size, mtime: base.mtime,
+                                         kind: 4, parser: "ocr"))
+        XCTAssertEqual(try index.file(path: base.path)?.revision, 3)
+        XCTAssertEqual(try index.file(path: base.path)?.record.parser, "ocr")
+    }
 }

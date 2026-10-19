@@ -42,7 +42,6 @@ final class ContentIndex {
     private(set) var usesWAL = true
     private let readOnly: Bool
     private var statements: [String: AITopicStatement] = [:]
-    private var inTransaction = false
 
     init(url: URL, readOnly: Bool = false) throws {
         self.readOnly = readOnly
@@ -81,7 +80,7 @@ final class ContentIndex {
 
     private func storedVersion() throws -> Int64 {
         let probe = try sql.prepare("PRAGMA user_version")
-        let hasVersion = try probe.next()
+        let hasVersion = try step(probe)
         let version = hasVersion ? probe.int(0) : 0
         sqlite3_reset(probe.handle)
         return version
@@ -119,7 +118,7 @@ final class ContentIndex {
         // serialised readers and writers, so record usesWAL instead of failing the open.
         do {
             let journal = try sql.prepare("PRAGMA journal_mode=WAL")
-            usesWAL = (try journal.next()) && journal.text(0).lowercased() == "wal"
+            usesWAL = (try step(journal)) && journal.text(0).lowercased() == "wal"
             sqlite3_reset(journal.handle)
         } catch {
             guard sqlite3_errcode(sql.db) == SQLITE_BUSY else { throw error }
@@ -190,17 +189,25 @@ final class ContentIndex {
     func count() throws -> Int {
         let statement = try statement("SELECT COUNT(*) FROM files")
         defer { sqlite3_reset(statement.handle) }
-        guard try statement.next() else { return 0 }
+        guard try step(statement) else { return 0 }
         return Int(statement.int(0))
     }
 }
 
 extension ContentIndex {
+    /// `AITopicStatement.next()` throws the shared wrapper's error type; callers of this class
+    /// should only ever see `ContentIndexError`.
+    @discardableResult
+    func step(_ statement: AITopicStatement) throws -> Bool {
+        do { return try statement.next() }
+        catch { throw ContentIndexError.database(error.localizedDescription) }
+    }
+
     func file(path: String) throws -> (record: ContentFileRecord, id: Int64, revision: Int64)? {
         let statement = try statement("SELECT id, size, mtime, kind, parser, revision FROM files WHERE path=?")
         defer { sqlite3_reset(statement.handle) }
         statement.bind([path])
-        guard try statement.next() else { return nil }
+        guard try step(statement) else { return nil }
         let record = ContentFileRecord(path: path, size: statement.int(1), mtime: statement.int(2),
                                        kind: UInt8(truncatingIfNeeded: statement.int(3)), parser: statement.text(4))
         return (record, statement.int(0), statement.int(5))
@@ -219,48 +226,73 @@ extension ContentIndex {
             defer { sqlite3_reset(statement.handle) }
             statement.bind([String(record.size), String(record.mtime), String(record.kind),
                             record.parser, String(existing.id)])
-            _ = try statement.next()
+            _ = try step(statement)
             return existing.id
         }
         let statement = try statement("INSERT INTO files(path,size,mtime,kind,parser) VALUES(?,?,?,?,?)")
         defer { sqlite3_reset(statement.handle) }
         statement.bind([record.path, String(record.size), String(record.mtime),
                         String(record.kind), record.parser])
-        _ = try statement.next()
+        _ = try step(statement)
         return sqlite3_last_insert_rowid(sql.db)
+    }
+
+    /// Metadata and chunks must commit together: `plan` decides whether to re-parse from the
+    /// stored size/mtime/parser, so committing new metadata with old chunks would make every
+    /// later sync skip the file and leave stale text searchable forever.
+    @discardableResult
+    func store(file record: ContentFileRecord, chunks: [ContentChunk]) throws -> Int64 {
+        try transaction {
+            let id = try upsert(file: record)
+            try replaceChunks(file: id, chunks: chunks)
+            return id
+        }
     }
 
     func replaceChunks(file id: Int64, chunks: [ContentChunk]) throws {
         try transaction {
             // The `chunk_postings_delete` trigger drops the matching postings.
             let drop = try statement("DELETE FROM chunks WHERE file=?")
-            drop.bind([String(id)]); _ = try drop.next(); sqlite3_reset(drop.handle)
+            drop.bind([String(id)]); _ = try step(drop); sqlite3_reset(drop.handle)
             // The blob column is last so the text binds can use one `bind` call.
             let insert = try statement("INSERT INTO chunks(file,ordinal,label,bytes,folded) VALUES(?,?,?,?,?)")
             let fts = try statement("INSERT INTO chunk_fts(rowid,grams) VALUES(?,?)")
+            var seen = Set<Int>()
             for chunk in chunks {
+                // The `UNIQUE(file, ordinal)` constraint would otherwise surface as a raw SQLite
+                // string; throw before the row is written so the caller learns what is wrong.
+                guard seen.insert(chunk.ordinal).inserted else {
+                    throw ContentIndexError.database("Duplicate chunk ordinal \(chunk.ordinal)")
+                }
                 // Grams must come from the folded text: `AITopicIndex` builds document grams
                 // from folded text (AITopicIndex.swift:274) and folds the query before gramming
                 // it (:618), so gramming raw text here would make matches case-sensitive.
                 let foldedText = AITopicIndex.fold(chunk.text)
+                // Guards the `bytes` CHECK, which would reject this body anyway, so nothing is
+                // compressed only to be refused by the constraint.
+                guard foldedText.utf8.count <= ContentCompression.maxBodyBytes else {
+                    throw ContentIndexError.database("Chunk body of \(foldedText.utf8.count) bytes exceeds the limit")
+                }
                 let folded = Data(foldedText.utf8)
                 let packed = ContentCompression.pack(folded, compact: true)
                 // `bytes` is the UNCOMPRESSED length: unpack decodes in one exact-size pass.
                 insert.bind([String(id), String(chunk.ordinal), chunk.label, String(folded.count)])
                 Self.bindBlob(packed, at: 5, into: insert)
-                _ = try insert.next()
+                _ = try step(insert)
                 let rowid = sqlite3_last_insert_rowid(sql.db)
                 sqlite3_reset(insert.handle)
                 let grams = try AITopicIndex.grams(foldedText, checkpoint: nil)
-                fts.bind([String(rowid), grams]); _ = try fts.next(); sqlite3_reset(fts.handle)
+                fts.bind([String(rowid), grams]); _ = try step(fts); sqlite3_reset(fts.handle)
             }
         }
     }
 
     static func bindBlob(_ data: Data, at column: Int32, into statement: AITopicStatement) {
-        let bytes = [UInt8](data)
+        // An empty array's base address is nil, and SQLite reads a nil pointer as SQL NULL, which
+        // `folded BLOB NOT NULL` rejects. Use a non-null pointer with a zero length instead.
+        let bytes = data.isEmpty ? [UInt8](repeating: 0, count: 1) : [UInt8](data)
         _ = bytes.withUnsafeBufferPointer {
-            sqlite3_bind_blob(statement.handle, column, $0.baseAddress, Int32($0.count),
+            sqlite3_bind_blob(statement.handle, column, $0.baseAddress, Int32(data.count),
                               unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         }
     }
@@ -269,42 +301,53 @@ extension ContentIndex {
         let statement = try statement("SELECT COUNT(*) FROM chunks WHERE file=?")
         defer { sqlite3_reset(statement.handle) }
         statement.bind([String(id)])
-        guard try statement.next() else { return 0 }
+        guard try step(statement) else { return 0 }
         return Int(statement.int(0))
     }
 
     func removeFile(path: String) throws {
+        // Probe outside the transaction so removing an absent path takes no write lock.
+        guard let existing = try file(path: path) else { return }
         try transaction {
-            guard let existing = try file(path: path) else { return }
             // Cascades to `chunks`, whose delete trigger drops the postings.
             let drop = try statement("DELETE FROM files WHERE id=?")
-            drop.bind([String(existing.id)]); _ = try drop.next(); sqlite3_reset(drop.handle)
+            drop.bind([String(existing.id)]); _ = try step(drop); sqlite3_reset(drop.handle)
         }
     }
 
+    /// Removes every file whose path starts with `prefix`. `prefix` must end with "/", otherwise a
+    /// prefix such as "/Volumes/X" would also match "/Volumes/Xavier/…".
+    ///
+    /// A range query rather than `LIKE`: SQLite's default LIKE is ASCII-case-insensitive, which
+    /// would delete `/Volumes/backup/…` for the prefix `/Volumes/Backup/`, and the range also
+    /// uses the `UNIQUE(path)` index instead of scanning.
     func removeFiles(prefix: String) throws {
-        let statement = try statement("SELECT path FROM files WHERE path LIKE ? ESCAPE '\\'")
-        let escaped = prefix.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
-        statement.bind([escaped + "%"])
+        // An empty prefix would otherwise match every path and wipe the whole index.
+        guard !prefix.isEmpty else { return }
+        let statement = try statement("SELECT path FROM files WHERE path >= ?1 AND path < ?2")
+        statement.bind([prefix, prefix + "\u{10FFFF}"])
         var paths: [String] = []
-        while try statement.next() { paths.append(statement.text(0)) }
+        while try step(statement) { paths.append(statement.text(0)) }
         // Reset before writing: `BEGIN IMMEDIATE` while a SELECT is still active on this
         // connection is the lock pattern this project has already been bitten by.
         sqlite3_reset(statement.handle)
         // One transaction for the whole prefix, so a failure cannot leave half a volume gone.
-        try transaction {
-            for path in paths { try removeFile(path: path) }
-        }
+        try transaction { for path in paths { try removeFile(path: path) } }
     }
 
-    func transaction(_ work: () throws -> Void) throws {
-        if inTransaction { try work(); return }
+    @discardableResult
+    func transaction<T>(_ work: () throws -> T) throws -> T {
+        // `sqlite3_get_autocommit` reports SQLite's own state, so unlike a separate flag it cannot
+        // desynchronise when a best-effort ROLLBACK fails and leave the connection unusable.
+        if sqlite3_get_autocommit(sql.db) == 0 { return try work() }
         try sql.run("BEGIN IMMEDIATE")
-        // Only mark the transaction open once BEGIN succeeded, or a failure leaves the flag stuck.
-        inTransaction = true
-        do { try work(); try sql.run("COMMIT") }
-        catch { try? sql.run("ROLLBACK"); inTransaction = false; throw error }
-        inTransaction = false
+        do {
+            let result = try work()
+            try sql.run("COMMIT")
+            return result
+        } catch {
+            try? sql.run("ROLLBACK")
+            throw error
+        }
     }
 }
