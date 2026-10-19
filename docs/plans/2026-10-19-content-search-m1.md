@@ -18,6 +18,8 @@
 - 关键约束：**内容索引存绝对路径，不存 entryID**。`compacted()` 会重排 entryID（`IndexStore+Mutation.swift:175-199`），存 id 会导致命中挂到错误文件上。理由见设计文档第 2 节。
 - 每完成一个 Task 都要跑一次免费版回归闸门。
 - 测试放 `Tests/OilFindUITests/`（代码在 `OilFindApp` 内，需要 `@testable import OilFindApp`）。
+- `ContentIndex` 对外的错误类型只有 `ContentIndexError`。`AITopicStatement.next()` 抛的是共享封装层的 `AITopicError`，所以 **Task 3 之后所有实现代码里的 `next()` 一律走 `ContentIndex.step(_:)`**，不要再直接 `try statement.next()`。测试里直接操作语句可以例外。
+- 元数据与块必须一起提交：用 `store(file:chunks:)`，不要自己拼 `upsert` + `replaceChunks`。`plan` 靠 `size/mtime/parser` 判断是否需要重解析，只提交元数据会让该文件此后永远被跳过，留下搜得到、其实已不存在的旧文本。
 
 ## 验证命令
 
@@ -789,7 +791,7 @@ extension ContentIndex {
         defer { sqlite3_reset(statement.handle) }
         statement.bind([query])
         var best: [String: ContentHit] = [:]
-        while try statement.next() {
+        while try step(statement) {
             if isCancelled() { return [] }
             // A NULL or unreadable body skips this row; it must not abort the whole query.
             let stored = blob(statement, 5)
@@ -917,6 +919,30 @@ final class ContentIndexSyncTests: XCTestCase {
         XCTAssertEqual(plan.removed, [])
         XCTAssertEqual(try index.count(), 1)
     }
+
+    /// `nil` means "could not parse". The previously indexed text must survive, and so must the
+    /// old metadata — otherwise the file would be classified `unchanged` and never retried.
+    func testApplyLeavesAFailedFileAlone() throws {
+        try index.store(file: .init(path: "/a/1.txt", size: 1, mtime: 1, kind: 3, parser: "text"),
+                        chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        let id = try XCTUnwrap(index.file(path: "/a/1.txt")?.id)
+        let plan = try index.plan(candidates: [.init(path: "/a/1.txt", size: 2, mtime: 2, kind: 3, parser: "text")])
+        XCTAssertEqual(plan.changed.count, 1)
+        try index.apply(plan) { _ in nil }
+        XCTAssertEqual(try index.chunkCount(file: id), 1)
+        XCTAssertEqual(try index.file(path: "/a/1.txt")?.record.mtime, 1)
+    }
+
+    /// An empty array is a different answer from `nil`: the file parsed and has no text.
+    func testApplyStoresEmptyResultsAndClearsOldChunks() throws {
+        try index.store(file: .init(path: "/a/1.txt", size: 1, mtime: 1, kind: 3, parser: "text"),
+                        chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        let id = try XCTUnwrap(index.file(path: "/a/1.txt")?.id)
+        let plan = try index.plan(candidates: [.init(path: "/a/1.txt", size: 2, mtime: 2, kind: 3, parser: "text")])
+        try index.apply(plan) { _ in [] }
+        XCTAssertEqual(try index.chunkCount(file: id), 0)
+        XCTAssertEqual(try index.file(path: "/a/1.txt")?.record.size, 2)
+    }
 }
 ```
 
@@ -954,18 +980,23 @@ extension ContentIndex {
         // Swift has `for ... where` but not `while ... where`.
         let statement = try statement("SELECT path FROM files")
         defer { sqlite3_reset(statement.handle) }
-        while try statement.next() {
+        while try step(statement) {
             let path = statement.text(0)
             if !seen.contains(path) { plan.removed.append(path) }
         }
         return plan
     }
 
-    func apply(_ plan: SyncPlan, parse: (ContentFileRecord) throws -> [ContentChunk]) throws {
+    /// `parse` returns nil when the file could not be parsed. The existing rows are then left
+    /// alone rather than replaced with nothing, so a transient failure (cancellation, a locked
+    /// file) cannot wipe content that indexed successfully before. An empty array is a different
+    /// answer: the file parsed fine and genuinely has no text.
+    func apply(_ plan: SyncPlan, parse: (ContentFileRecord) -> [ContentChunk]?) throws {
         for path in plan.removed { try removeFile(path: path) }
         for record in plan.added + plan.changed {
-            let id = try upsert(file: record)
-            try replaceChunks(file: id, chunks: try parse(record))
+            guard let chunks = parse(record) else { continue }
+            // `store` commits the metadata and the chunks together; see the comment on it.
+            try store(file: record, chunks: chunks)
         }
     }
 }
@@ -1473,9 +1504,9 @@ final class ContentIndexer {
         }
         let plan = try index.plan(candidates: candidates, complete: complete)
         try index.apply(plan) { record in
-            guard let parser = parsers.first(where: { $0.identifier == record.parser }) else { return [] }
+            guard let parser = parsers.first(where: { $0.identifier == record.parser }) else { return nil }
             do { return try parser.parse(url: URL(fileURLWithPath: record.path), budget: budget, isCancelled: isCancelled) }
-            catch { failedCount += 1; return [] }
+            catch { failedCount += 1; return nil }
         }
     }
 
