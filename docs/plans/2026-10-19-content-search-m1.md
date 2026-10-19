@@ -50,7 +50,7 @@ final class ContentSearchSupportTests: XCTestCase {
     /// Deterministic, so a failure is reproducible. `UInt8.random` here only adds flakiness.
     private func pseudorandomBytes(_ count: Int) -> Data {
         var state: UInt64 = 0x9E37_79B9_7F4A_7C15
-        return Data((0..<count).map { _ in
+        return Data((0..<count).map { _ -> UInt8 in
             state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
             return UInt8(truncatingIfNeeded: state >> 33)
         })
