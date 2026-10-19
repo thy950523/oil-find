@@ -1659,7 +1659,6 @@ import OilFindCore
 /// Publishes content matches as supplementary hits on file rows.
 final class ContentSearchProvider: SupplementarySearchProvider {
     private let index: ContentIndex?
-    private let queue = DispatchQueue(label: "com.oiloil.find.content.search", qos: .userInitiated)
     var isEnabled = true
 
     /// Optional so a disabled manager can exist without opening a database.
