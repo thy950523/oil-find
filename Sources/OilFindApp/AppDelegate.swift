@@ -18,7 +18,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private let panel = SearchPanel()
     private let topics = AITopicManager()
-    private let contentSearch = ContentManager()
+    // Lazy so that merely constructing an `AppDelegate` does not open the content database. Tests
+    // build delegates to inspect the menu without launching, and would otherwise create the real
+    // index under Application Support.
+    private lazy var contentSearch = ContentManager()
     private lazy var topicSearch = AITopicSearchProvider(manager: topics)
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
