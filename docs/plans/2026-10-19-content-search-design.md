@@ -220,18 +220,19 @@ detail 形如 `图片中文字: …片段…` 或 `第 3 页: …片段…`。
 
 `L10n.swift` 加中英对照键。`L10n` 是 internal，同 module 可直接用。
 
-### DEBUG 验证不需要改 `Snapshot`
+### DEBUG 验证：设置分区可用，命中界面**不可用**
 
-`Snapshot.run` 的 `allowed` 集合写死在 `Snapshot.swift:12`，但现成参数够用：
+`Snapshot.run` 的 `allowed` 集合写死在 `Snapshot.swift:12`。设置分区可以直接出图：
 
 ```sh
-"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/hit.png --query 收据
-"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/settings.png --state settings --settings-scroll 0.3
+"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/settings.png --state settings --settings-scroll 0.78
 ```
 
-前者出内容命中界面，后者出设置分区。省掉一处公开库改动。
+`--settings-scroll` 收的是 **0…1 的滚动比例**，不是分区名（`Snapshot.swift:130` 用 `Double(value)` 解析，传分区名会报 `Invalid settings scroll fraction`）。内容分区在 AI 话题之后，实测 **0.78** 才能整段入画，`0.3` 只到"外置磁盘"。
 
-`--settings-scroll` 收的是 **0…1 的滚动比例**，不是分区名（`Snapshot.swift:130` 用 `Double(value)` 解析，传分区名会报 `Invalid settings scroll fraction`）；内容分区在 AI 话题之后，先取 `0.3`，看不全再调大。
+**但 `--query` 出不了内容命中界面。** 本节原先写"DEBUG 验证不需要改 `Snapshot`、现成参数够用"是**错的**：`Snapshot.swift:148` 直接赋 `appExtension?.supplementarySearchProvider`，从不安装多路复用器，而免费版下 `appExtension` 为 nil，于是快照里根本没有 supplementary provider，内容命中永远不会出现。
+
+后果：M1 的"截图里的中文能被搜到、命中行有 detail 和高亮"**没有截图证据**。解析侧由 `ImageOCRParserTests` 覆盖，detail 文本与高亮偏移由 `ContentSearchProviderTests` 覆盖，`ContentSearchIntegrationTests` 覆盖"真实解析器 → 索引器 → 检索"整链，但 `ResultsView` 对内容命中行的实际渲染仍未覆盖。要补上得让 `Snapshot` 装上 provider（属于公开库改动）。
 
 ### 测试（放 `Tests/OilFindUITests`，代码在 `OilFindApp` 内）
 
