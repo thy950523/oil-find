@@ -1037,6 +1037,16 @@ final class ImageOCRParserTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         XCTAssertTrue(try ImageOCRParser().parse(url: url, budget: AITopicWorkBudget(), isCancelled: { true }).isEmpty)
     }
+
+    /// A long edge past `maximumDimension` must still be recognized: the parser downsamples first
+    /// rather than handing a huge bitmap to Vision, which cannot yield once it starts.
+    func testDownsamplesVeryWideImages() throws {
+        guard ProcessInfo.processInfo.environment["CI"] != "true" else { throw XCTSkip("OCR needs a real Vision runtime") }
+        let url = try screenshot("开具发票", size: NSSize(width: 4200, height: 600))
+        defer { try? FileManager.default.removeItem(at: url) }
+        let chunks = try ImageOCRParser().parse(url: url, budget: AITopicWorkBudget(), isCancelled: { false })
+        XCTAssertTrue(chunks.first?.text.contains("发票") == true, "recognized: \(chunks.first?.text ?? "")")
+    }
 }
 ```
 
@@ -1070,6 +1080,7 @@ enum ContentParserError: Error { case unsupported, tooLarge, damaged }
 
 ```swift
 import Foundation
+import ImageIO
 import Vision
 
 /// Vision text recognition. Revision is part of the identifier so a revision change reindexes.
@@ -1093,7 +1104,10 @@ struct ImageOCRParser: ContentParser {
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "en-US"]
         request.usesLanguageCorrection = true
-        let handler = VNImageRequestHandler(url: url, options: [:])
+        // Passing a `CGImage` bypasses Vision's own EXIF handling, which is why the thumbnail is
+        // created with `kCGImageSourceCreateThumbnailWithTransform`.
+        let handler = Self.downsampledImage(at: url).map { VNImageRequestHandler(cgImage: $0, options: [:]) }
+            ?? VNImageRequestHandler(url: url, options: [:])
         do { try handler.perform([request]) }
         catch { throw ContentParserError.damaged }
         guard !isCancelled(), let observations = request.results, !observations.isEmpty else { return [] }
@@ -1107,6 +1121,24 @@ struct ImageOCRParser: ContentParser {
         let text = lines.joined(separator: "\n")
         guard !text.isEmpty else { return [] }
         return [ContentChunk(ordinal: 0, label: "", text: text)]
+    }
+
+    /// `perform` blocks and cannot yield, so a 50 MP photo would stall the indexer for the whole
+    /// call. Decoding a thumbnail first bounds that. Returns nil when the image is already small
+    /// enough or cannot be decoded, in which case the caller hands the URL to Vision directly and
+    /// lets it report the failure.
+    private static func downsampledImage(at url: URL) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? CGFloat,
+              let height = properties[kCGImagePropertyPixelHeight] as? CGFloat,
+              max(width, height) > maximumDimension else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximumDimension,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 }
 ```
@@ -1630,8 +1662,11 @@ final class ContentSearchProvider: SupplementarySearchProvider {
         }
     }
 
+    /// Image chunks carry no label, so they take one from the file kind instead: the detail line
+    /// reads "图片中文字：…" for images and "第 3 页：…" for documents.
     private static func makeHit(hit: ContentHit, source: SearchSource, entryID: UInt32, version: UInt64) -> SupplementaryHit {
-        let prefix = hit.label.isEmpty ? "" : hit.label + "："
+        let label = hit.label.isEmpty && hit.kind == 4 ? L10n.text("contentImageText") : hit.label
+        let prefix = label.isEmpty ? "" : label + "："
         let detail = prefix + hit.snippet
         // `highlights` are offsets inside `hit.snippet`; shift them past the label prefix.
         let offset = (prefix as NSString).length
@@ -1808,7 +1843,8 @@ final class ContentSettingsTests: XCTestCase {
         XCTAssertFalse(manager.provider.isEnabled)
     }
     func testLocalizedCopyExistsInBothLanguages() throws {
-        for key in ["contentTitle", "contentEnabled", "contentPrivacy", "contentBuilding", "contentDone"] {
+        for key in ["contentTitle", "contentEnabled", "contentImageText", "contentPrivacy",
+                    "contentBuilding", "contentDone", "contentRebuild", "contentClear"] {
             XCTAssertNotEqual(L10n.text(key, chinese: true), key)
             XCTAssertNotEqual(L10n.text(key, chinese: false), key)
         }
@@ -1990,6 +2026,7 @@ final class ContentManager: ObservableObject {
 ```swift
 "contentTitle": ("文件内容", "File contents"),
 "contentEnabled": ("搜索图片和文档里的文字", "Search text inside images and documents"),
+"contentImageText": ("图片中文字", "Text in image"),
 "contentPrivacy": ("图片和文档都在本机处理，不会上传。", "Images and documents are processed on this Mac and never uploaded."),
 "contentBuilding": ("正在建立内容索引…", "Building content index…"),
 "contentDone": ("已索引 %@ 个文件", "Indexed %@ files"),
