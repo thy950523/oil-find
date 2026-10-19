@@ -1880,6 +1880,10 @@ final class ContentManager: ObservableObject {
 
     /// `indexURL: nil` is fully inert: no database is opened and nothing is written to disk.
     /// Tests use it so they never touch the user's real Application Support folder.
+    ///
+    /// The two opens happen on the calling thread (the main thread at launch). That is bounded:
+    /// `ContentIndex` gives up on a contended migration lock after a 2 s deadline, so a second
+    /// instance rebuilding concurrently can delay launch but cannot hang it.
     init(defaults: UserDefaults = .standard, indexURL: URL? = ContentIndex.defaultURL) {
         self.defaults = defaults
         self.indexURL = indexURL
