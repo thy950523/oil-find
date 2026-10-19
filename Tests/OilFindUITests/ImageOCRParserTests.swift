@@ -168,4 +168,15 @@ final class ImageOCRParserTests: XCTestCase {
         try Data().write(to: url)
         XCTAssertTrue(try parser.parse(url: url, budget: budget, isCancelled: { false }).isEmpty)
     }
+
+    /// A text file named `.png` is not an image and never will be, so it must parse as "no text"
+    /// rather than throw: throwing would count it as a failure on every sync forever, so the failed
+    /// count a user sees could never fall. ImageIO reports `unknownType` for frame 0 (the
+    /// source-level status is `invalidData`, which the transient fixtures report too), so the check
+    /// has to be made at the frame level. Needs no Vision, so it runs on CI.
+    func testNonImageBytesWithAnImageExtensionProduceNoChunks() throws {
+        let url = directory.appendingPathComponent("not-an-image.png")
+        try Data("this file is plain text, not a PNG image at all".utf8).write(to: url)
+        XCTAssertTrue(try parser.parse(url: url, budget: budget, isCancelled: { false }).isEmpty)
+    }
 }

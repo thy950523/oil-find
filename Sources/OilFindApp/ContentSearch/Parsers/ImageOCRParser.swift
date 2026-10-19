@@ -37,13 +37,20 @@ struct ImageOCRParser: ContentParser {
                                                       [kCGImageSourceShouldCache: false] as CFDictionary) else {
             throw ContentParserError.damaged
         }
-        // Bytes that are not an image at all (a text file named `.png`, or random data) make ImageIO
-        // report `unknownType`, which no transient state explains, so re-feeding them to Vision on
-        // every sync would keep the failed count from ever falling. They are recorded as textless
-        // instead. This is deliberately narrow: truncated or partially-downloaded files report
-        // `unexpectedEOF`, `incomplete` or `invalidData`, which can be transient, and recording those
-        // as textless would permanently discard text that a later, complete read could still extract.
-        if CGImageSourceGetStatus(source) == .statusUnknownType {
+        // Bytes that are not an image at all (a text file named `.png`, an HTML error page saved as
+        // `.jpg`, or random data) report `unknownType` for frame 0, which no transient state explains,
+        // so re-feeding them to Vision on every sync would keep the failed count from ever falling.
+        // They are recorded as textless instead. The status is read at the frame level because the
+        // source-level status reports `invalidData` for every one of these fixtures, the transient
+        // ones included, so it cannot tell a non-image from a truncated file. No frame-count guard
+        // gates the read: ImageIO answers for index 0 even when the source holds no frames, and that
+        // answer is exactly what separates a non-image (`unknownType`) from a header-only partial
+        // download (which can report `unexpectedEOF` with no frames either), so requiring a positive
+        // count would silence the rule. The rule stays deliberately narrow: truncated or
+        // partially-downloaded files report `unexpectedEOF` or `incomplete` for frame 0, which can be
+        // transient, and recording those as textless would permanently discard text that a later,
+        // complete read could still extract.
+        if CGImageSourceGetStatusAtIndex(source, 0) == .statusUnknownType {
             return []
         }
         let request = VNRecognizeTextRequest()
