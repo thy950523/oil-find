@@ -473,7 +473,9 @@ final class ContentIndexWriteTests: XCTestCase {
         let first = try index.upsert(file: record)
         XCTAssertEqual(try index.upsert(file: record), first)
         XCTAssertEqual(try index.count(), 1)
-        var changed = record; changed.size = 20
+        // `ContentFileRecord` has `let` fields, so build a new record rather than mutating.
+        let changed = ContentFileRecord(path: record.path, size: 20, mtime: record.mtime,
+                                        kind: record.kind, parser: record.parser)
         XCTAssertEqual(try index.upsert(file: changed), first)
         XCTAssertEqual(try index.file(path: "/a/b.pdf")?.revision, 2)
         XCTAssertEqual(try index.file(path: "/a/b.pdf")?.record.size, 20)
@@ -509,6 +511,19 @@ final class ContentIndexWriteTests: XCTestCase {
         XCTAssertEqual(try index.count(), 1)
         XCTAssertEqual(try ftsRowCount(), 1)
         XCTAssertNotNil(try index.file(path: "/Users/me/c.txt"))
+    }
+
+    /// Grams for a chunk must come from folded text. Task 4 folds the query before gramming it,
+    /// so gramming raw text here would silently make content search case-sensitive.
+    func testGramsAreBuiltFromFoldedText() throws {
+        let id = try index.upsert(file: .init(path: "/a/Invoice.txt", size: 1, mtime: 1, kind: 3, parser: "text"))
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "", text: "INVOICE 发票")])
+        let query = AITopicIndex.grams(AITopicIndex.fold("invoice"), query: true)
+        let statement = try index.statement("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH ?")
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([query])
+        XCTAssertTrue(try statement.next())
+        XCTAssertEqual(statement.int(0), 1)
     }
 }
 ```
@@ -567,7 +582,11 @@ extension ContentIndex {
             let insert = try statement("INSERT INTO chunks(file,ordinal,label,bytes,folded) VALUES(?,?,?,?,?)")
             let fts = try statement("INSERT INTO chunk_fts(rowid,grams) VALUES(?,?)")
             for chunk in chunks {
-                let folded = Data(AITopicIndex.fold(chunk.text).utf8)
+                // Grams must come from the folded text: `AITopicIndex` builds document grams
+                // from folded text (AITopicIndex.swift:274) and folds the query before gramming
+                // it (:618), so gramming raw text here would make matches case-sensitive.
+                let foldedText = AITopicIndex.fold(chunk.text)
+                let folded = Data(foldedText.utf8)
                 let packed = ContentCompression.pack(folded, compact: true)
                 // `bytes` is the UNCOMPRESSED length: unpack decodes in one exact-size pass.
                 insert.bind([String(id), String(chunk.ordinal), chunk.label, String(folded.count)])
@@ -575,7 +594,7 @@ extension ContentIndex {
                 _ = try insert.next()
                 let rowid = sqlite3_last_insert_rowid(sql.db)
                 sqlite3_reset(insert.handle)
-                let grams = try AITopicIndex.grams(chunk.text, checkpoint: nil)
+                let grams = try AITopicIndex.grams(foldedText, checkpoint: nil)
                 fts.bind([String(rowid), grams]); _ = try fts.next(); sqlite3_reset(fts.handle)
             }
         }
@@ -608,13 +627,18 @@ extension ContentIndex {
 
     func removeFiles(prefix: String) throws {
         let statement = try statement("SELECT path FROM files WHERE path LIKE ? ESCAPE '\\'")
-        defer { sqlite3_reset(statement.handle) }
         let escaped = prefix.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
         statement.bind([escaped + "%"])
         var paths: [String] = []
         while try statement.next() { paths.append(statement.text(0)) }
-        for path in paths { try removeFile(path: path) }
+        // Reset before writing: `BEGIN IMMEDIATE` while a SELECT is still active on this
+        // connection is the lock pattern this project has already been bitten by.
+        sqlite3_reset(statement.handle)
+        // One transaction for the whole prefix, so a failure cannot leave half a volume gone.
+        try transaction {
+            for path in paths { try removeFile(path: path) }
+        }
     }
 
     func transaction(_ work: () throws -> Void) throws {
