@@ -415,30 +415,45 @@ extension ContentIndex {
         return (record, statement.int(0), statement.int(5))
     }
 
-    func file(path: String) throws -> (size: Int64, revision: Int64)? {
-        try file(path: path).map { ($0.record.size, $0.revision) }
-    }
-
+    // Note: do not add a second `file(path:)` overload that differs only in return type.
+    // `try index.file(path: p)?.revision` is then ambiguous, and the tests rely on it.
     @discardableResult
     func upsert(file record: ContentFileRecord) throws -> Int64 {
         if let existing = try file(path: record.path) {
             guard existing.record.size != record.size || existing.record.mtime != record.mtime
-                || existing.record.parser != record.parser else { return existing.id }
+                || existing.record.kind != record.kind || existing.record.parser != record.parser else {
+                return existing.id
+            }
             let statement = try statement("UPDATE files SET size=?, mtime=?, kind=?, parser=?, revision=revision+1 WHERE id=?")
             defer { sqlite3_reset(statement.handle) }
-            statement.bind([String(record.size), String(record.mtime), String(record.kind), record.parser, String(existing.id)])
+            statement.bind([String(record.size), String(record.mtime), String(record.kind),
+                            record.parser, String(existing.id)])
             _ = try statement.next()
             return existing.id
         }
         let statement = try statement("INSERT INTO files(path,size,mtime,kind,parser) VALUES(?,?,?,?,?)")
         defer { sqlite3_reset(statement.handle) }
-        statement.bind([record.path, String(record.size), String(record.mtime), String(record.kind), record.parser])
+        statement.bind([record.path, String(record.size), String(record.mtime),
+                        String(record.kind), record.parser])
         _ = try statement.next()
         return sqlite3_last_insert_rowid(sql.db)
     }
 
     func replaceChunks(file id: Int64, chunks: [ContentChunk]) throws {
         try transaction {
+            // Postings live in a separate contentless table with no cascade, and `chunks.id`
+            // is AUTOINCREMENT so ids are never reused: skipping this leaks every replaced
+            // chunk's postings for the life of the index.
+            let select = try statement("SELECT id FROM chunks WHERE file=?")
+            select.bind([String(id)])
+            var rowids: [Int64] = []
+            while try select.next() { rowids.append(select.int(0)) }
+            sqlite3_reset(select.handle)
+            let dropPostings = try statement("DELETE FROM chunk_fts WHERE rowid=?")
+            for rowid in rowids {
+                dropPostings.bind([String(rowid)]); _ = try dropPostings.next()
+                sqlite3_reset(dropPostings.handle)
+            }
             let drop = try statement("DELETE FROM chunks WHERE file=?")
             drop.bind([String(id)]); _ = try drop.next(); sqlite3_reset(drop.handle)
             // The blob column is last so the text binds can use one `bind` call.
@@ -505,8 +520,9 @@ extension ContentIndex {
 
     func transaction(_ work: () throws -> Void) throws {
         if inTransaction { try work(); return }
-        inTransaction = true
         try sql.run("BEGIN IMMEDIATE")
+        // Only mark the transaction open once BEGIN succeeded, or a failure leaves the flag stuck.
+        inTransaction = true
         do { try work(); try sql.run("COMMIT") }
         catch { try? sql.run("ROLLBACK"); inTransaction = false; throw error }
         inTransaction = false
@@ -614,11 +630,13 @@ extension ContentIndex {
     /// Candidates come from the gram index; every candidate is then verified byte by byte so
     /// matches spanning two grams or two chunks are never reported.
     func search(_ text: String, limit: Int, isCancelled: () -> Bool) throws -> [ContentHit] {
-        let needle = Array(AITopicIndex.fold(text).utf8)
-        guard !needle.isEmpty, limit > 0 else { return [] }
-        let terms = Array(Set(AITopicIndex.fold(text).split(whereSeparator: { $0.isWhitespace }).map(String.init))).sorted()
-        guard !terms.isEmpty else { return [] }
-        let query = Set(terms.flatMap { AITopicIndex.grams($0, query: true).components(separatedBy: " AND ") })
+        let folded = AITopicIndex.fold(text)
+        let terms = Array(Set(folded.split(whereSeparator: { $0.isWhitespace }).map(String.init))).sorted()
+        guard limit > 0, !terms.isEmpty else { return [] }
+        let needles = terms.map { Array($0.utf8) }
+        // `grams` throws, so it cannot be called from inside `flatMap` without `try` there.
+        let gramsPerTerm = try terms.map { AITopicIndex.grams($0, query: true) }
+        let query = Set(gramsPerTerm.flatMap { $0.components(separatedBy: " AND ") })
             .sorted().joined(separator: " AND ")
         guard !query.isEmpty else { return [] }
 
@@ -634,51 +652,62 @@ extension ContentIndex {
             if isCancelled() { return [] }
             // A NULL or unreadable body skips this row; it must not abort the whole query.
             let stored = blob(statement, 4)
-            guard !stored.isEmpty, let folded = try? ContentCompression.unpack(stored, bytes: Int(statement.int(5))) else { continue }
-            let bytes = [UInt8](folded)
-            guard let ranges = Self.ranges(of: needle, in: bytes), !ranges.isEmpty else { continue }
+            guard !stored.isEmpty,
+                  let body = try? ContentCompression.unpack(stored, bytes: Int(statement.int(5))) else { continue }
+            let bytes = [UInt8](body)
+            // The gram AND admits false positives; every term must also appear literally.
+            guard needles.allSatisfy({ !Self.byteRanges(of: $0, in: bytes).isEmpty }) else { continue }
             let path = statement.text(1)
-            let snippet = Self.snippet(bytes: bytes, ranges: ranges)
-            let hit = ContentHit(path: path, label: statement.text(3), snippet: snippet.text, highlights: snippet.highlights)
-            if let existing = best[path], existing.highlights.count >= ranges.count { continue }
-            best[path] = hit
+            let snippet = Self.snippet(text: String(decoding: bytes, as: UTF8.self), terms: terms)
+            if let existing = best[path], existing.highlights.count >= snippet.highlights.count { continue }
+            best[path] = ContentHit(path: path, label: statement.text(3), snippet: snippet.text,
+                                    highlights: snippet.highlights)
             if best.count >= limit { break }
         }
         return best.values.sorted { $0.path < $1.path }
     }
 
-    /// Byte-level search over the folded body, returning UTF-16 ranges for AppKit.
-    private static func ranges(of needle: [UInt8], in haystack: [UInt8]) -> [NSRange]? {
-        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
-        var utf16 = [Int](repeating: 0, count: haystack.count + 1)
-        var units = 0
-        for (i, byte) in haystack.enumerated() {
-            utf16[i] = units
-            // Continuation bytes do not advance the UTF-16 offset within a scalar's first two bytes.
-            if byte & 0xC0 != 0x80 || byte < 0x80 { units += 1 }
-        }
-        utf16[haystack.count] = units
-        var result: [NSRange] = []
+    /// Byte-level verification. A match can never start inside a multi-byte scalar, because a
+    /// valid UTF-8 lead byte is never a continuation byte, so this cannot report a partial match.
+    private static func byteRanges(of needle: [UInt8], in haystack: [UInt8]) -> [Range<Int>] {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return [] }
+        var result: [Range<Int>] = []
         var i = 0
         while i + needle.count <= haystack.count {
             if haystack[i] == needle[0], haystack[i..<i + needle.count].elementsEqual(needle) {
-                result.append(NSRange(location: utf16[i], length: utf16[i + needle.count] - utf16[i]))
+                result.append(i..<i + needle.count)
                 i += needle.count
             } else { i += 1 }
         }
         return result
     }
 
-    private static func snippet(bytes: [UInt8], ranges: [NSRange], window: Int = 40) -> (text: String, highlights: [NSRange]) {
-        let first = ranges[0]
-        let start = max(0, first.location - window), end = min(bytes.count, first.location + first.length + window)
-        let slice = Array(bytes[start..<end])
-        let text = String(decoding: slice, as: UTF8.self)
-        let highlights = ranges.compactMap { range -> NSRange? in
-            let lower = max(range.location, start), upper = min(range.location + range.length, end)
-            return upper > lower ? NSRange(location: lower - start, length: upper - lower) : nil
+    /// `before` / `after` count UTF-16 units, not characters. Ranges are computed on the decoded
+    /// text rather than the bytes, because byte offsets do not map linearly to UTF-16 offsets and
+    /// `ResultsView` colours with `NSRange`. The caller has already verified the terms are present.
+    private static func snippet(text: String, terms: [String], before: Int = 40,
+                                after: Int = 60) -> (text: String, highlights: [NSRange]) {
+        var ranges: [NSRange] = []
+        for term in terms {
+            var search = text.startIndex..<text.endIndex
+            while let found = text.range(of: term, range: search) {
+                ranges.append(NSRange(found, in: text))
+                guard ranges.count < 20 else { break }
+                search = found.upperBound..<text.endIndex
+            }
         }
-        return (text, highlights)
+        guard let first = ranges.min(by: { $0.location < $1.location }) else { return (text, []) }
+        let base = max(0, first.location - before)
+        let limit = min(text.utf16.count, NSMaxRange(first) + after)
+        guard let window = Range(NSRange(location: base, length: limit - base), in: text) else {
+            return (text, ranges)
+        }
+        let shown = NSRange(window, in: text)
+        let highlights = ranges.compactMap { range -> NSRange? in
+            guard range.location >= shown.location, NSMaxRange(range) <= NSMaxRange(shown) else { return nil }
+            return NSRange(location: range.location - shown.location, length: range.length)
+        }
+        return (String(text[window]), highlights)
     }
 
     private func blob(_ statement: AITopicStatement, _ column: Int32) -> Data {
