@@ -37,7 +37,7 @@ python3 Tests/Scripts/test_open_core.py
 
 **Files:**
 - Modify: `Sources/OilFindApp/AITopics/AITopicIndex.swift:193`
-- Create: `Sources/OilFindApp/ContentSearch/Support/Compression.swift`
+- Create: `Sources/OilFindApp/ContentSearch/Support/ContentCompression.swift`
 - Test: `Tests/OilFindUITests/ContentSearchSupportTests.swift`
 
 **Step 1: 写失败测试**
@@ -89,7 +89,7 @@ final class ContentSearchSupportTests: XCTestCase {
 **Step 2: 跑测试确认失败**
 
 Run: `swift test --filter ContentSearchSupportTests`
-Expected: 编译失败，`cannot find 'Compression' in scope`
+Expected: 编译失败，`cannot find 'ContentCompression' in scope`
 
 **Step 3: 实现**
 
@@ -99,7 +99,7 @@ Expected: 编译失败，`cannot find 'Compression' in scope`
     static func grams(_ text: String, query: Bool = false, checkpoint: (() throws -> Void)?) throws -> String {
 ```
 
-新建 `Sources/OilFindApp/ContentSearch/Support/Compression.swift`：
+新建 `Sources/OilFindApp/ContentSearch/Support/ContentCompression.swift`：
 
 ```swift
 import Foundation
@@ -176,7 +176,7 @@ Expected: 全部 PASS
 **Step 6: 提交**
 
 ```sh
-git add Sources/OilFindApp/AITopics/AITopicIndex.swift Sources/OilFindApp/ContentSearch/Support/Compression.swift Tests/OilFindUITests/ContentSearchSupportTests.swift
+git add Sources/OilFindApp/AITopics/AITopicIndex.swift Sources/OilFindApp/ContentSearch/Support/ContentCompression.swift Tests/OilFindUITests/ContentSearchSupportTests.swift
 git commit -m "feat(content): add compression helper and expose gram checkpoints"
 ```
 
@@ -230,7 +230,7 @@ Expected: 编译失败，`cannot find 'ContentIndex' in scope`
 import Foundation
 import SQLite3
 
-// `ContentIndexError` lives in ContentSearch/Support/Compression.swift (added in Task 1).
+// `ContentIndexError` lives in ContentSearch/Support/ContentCompression.swift (added in Task 1).
 
 struct ContentChunk {
     let ordinal: Int
