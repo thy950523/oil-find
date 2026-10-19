@@ -500,3 +500,67 @@ extension ContentIndex {
         return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement.handle, column)))
     }
 }
+
+extension ContentIndex {
+    /// The diff between a candidate snapshot of the file index and the rows already stored.
+    /// `removed` is only populated for a complete enumeration: see `plan`.
+    struct SyncPlan {
+        var added: [ContentFileRecord] = []
+        var changed: [ContentFileRecord] = []
+        var unchanged: [ContentFileRecord] = []
+        var removed: [String] = []
+    }
+
+    /// Classifies `candidates` against the stored rows. `size`, `mtime` and `parser` all equal means
+    /// the file is already indexed exactly as it stands; any difference forces a re-parse, and an
+    /// absent row is new.
+    ///
+    /// `complete` is false when the candidate enumeration could not finish. `removed` is computed
+    /// only then from a complete snapshot: deleting on a partial one would wipe every file the
+    /// interrupted scan had not reached yet, so an incomplete enumeration deletes nothing.
+    func plan(candidates: [ContentFileRecord], complete: Bool = true) throws -> SyncPlan {
+        var result = SyncPlan()
+        var seen = Set<String>()
+        seen.reserveCapacity(candidates.count)
+        for candidate in candidates {
+            seen.insert(candidate.path)
+            guard let existing = try file(path: candidate.path) else {
+                result.added.append(candidate)
+                continue
+            }
+            if existing.record.size == candidate.size, existing.record.mtime == candidate.mtime,
+               existing.record.parser == candidate.parser {
+                result.unchanged.append(candidate)
+            } else {
+                result.changed.append(candidate)
+            }
+        }
+        guard complete else { return result }
+        // Swift has `for ... where` but no `while ... where`, so the membership test lives in the
+        // body. The stored paths absent from the snapshot are the files the file system dropped.
+        let statement = try statement("SELECT path FROM files")
+        while try step(statement) {
+            let path = statement.text(0)
+            if !seen.contains(path) { result.removed.append(path) }
+        }
+        sqlite3_reset(statement.handle)
+        return result
+    }
+
+    /// Applies a plan. Deletions come first so a path that moved and was re-added in the same
+    /// snapshot cannot be removed after it was written.
+    ///
+    /// A record whose parse returns nil keeps its existing row untouched: a transient failure
+    /// (cancellation, a locked file) must not replace successfully indexed text with nothing, and
+    /// the old metadata is what makes the next run classify the file as `changed` and retry it.
+    /// Committing the metadata first would mark the file `unchanged` and never retry. An empty
+    /// array is a different answer: the file parsed and genuinely has no text, so its chunks are
+    /// cleared and its new metadata is stored.
+    func apply(_ plan: SyncPlan, parse: (ContentFileRecord) -> [ContentChunk]?) throws {
+        for path in plan.removed { try removeFile(path: path) }
+        for record in plan.added + plan.changed {
+            guard let chunks = parse(record) else { continue }
+            try store(file: record, chunks: chunks)
+        }
+    }
+}
