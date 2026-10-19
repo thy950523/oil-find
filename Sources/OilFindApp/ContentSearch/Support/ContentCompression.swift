@@ -1,11 +1,7 @@
 import Foundation
 import Compression
 
-/// Shared by every content search component. Defined here so Task 1 compiles on its own.
-enum ContentIndexError: Error, LocalizedError {
-    case database(String)
-    var errorDescription: String? { if case .database(let message) = self { return message }; return nil }
-}
+// `ContentIndexError`, shared by every content search component, is defined in ContentIndex.swift.
 
 /// Body compression for the content index.
 ///

@@ -23,13 +23,12 @@ final class ContentIndexSchemaTests: XCTestCase {
         ])
         XCTAssertEqual(try index.count(), 0)
     }
-    func testRebuildsWhenTheExistingSchemaIsNotCanonical() throws {
+    func testRebuildsWhenStoredVersionIsStale() throws {
         let url = tempURL(); defer { removeDatabase(url) }
         do {
             let sql = try AITopicSQL(url)
             try sql.run("CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE)")
-            // Seed a stale version explicitly so the rebuild is forced by the stamp, not merely
-            // by the missing canonical columns.
+            // Seed a stale version explicitly so the rebuild is forced by the stamp.
             try sql.run("PRAGMA user_version = \(ContentIndex.schemaVersion - 1)")
         }
         _ = try ContentIndex(url: url)
@@ -39,7 +38,28 @@ final class ContentIndexSchemaTests: XCTestCase {
         XCTAssertTrue(try sql.tables().contains("chunk_fts"))
         let probe = try sql.prepare("PRAGMA user_version")
         XCTAssertTrue(try probe.next())
-        XCTAssertEqual(probe.int(0), 1)
+        XCTAssertEqual(probe.int(0), Int64(ContentIndex.schemaVersion))
+    }
+    func testDeletingAFileCascadesToChunksAndFtsPostings() throws {
+        let url = tempURL(); defer { removeDatabase(url) }
+        let index = try ContentIndex(url: url)
+        try index.sql.run("""
+            INSERT INTO files(id, path, size, mtime, kind, parser) VALUES(1, '/a/b.txt', 1, 1, 3, 'text');
+            INSERT INTO chunks(id, file, ordinal, label, folded, bytes) VALUES(1, 1, 0, '第 1 页', X'00', 0);
+            INSERT INTO chunk_fts(rowid, grams) VALUES(1, 'abc');
+            """)
+        let sql = try AITopicSQL(url, readOnly: true)
+        XCTAssertEqual(try count("chunk_fts", sql), 1)
+        // Deleting the file must cascade to its chunks, and the AFTER DELETE trigger must clear the
+        // posting through that cascade, which proves foreign_keys=ON and the trigger both hold.
+        try index.sql.run("DELETE FROM files WHERE id = 1")
+        XCTAssertEqual(try count("chunks", sql), 0)
+        XCTAssertEqual(try count("chunk_fts", sql), 0)
+    }
+    private func count(_ table: String, _ sql: AITopicSQL) throws -> Int64 {
+        let statement = try sql.prepare("SELECT COUNT(*) FROM \(table)")
+        guard try statement.next() else { return 0 }
+        return statement.int(0)
     }
     func testReopenKeepsTheSchemaVersionAndDoesNotRebuild() throws {
         let url = tempURL(); defer { removeDatabase(url) }

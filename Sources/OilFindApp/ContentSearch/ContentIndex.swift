@@ -1,7 +1,11 @@
 import Foundation
 import SQLite3
 
-// `ContentIndexError` lives in ContentSearch/Support/ContentCompression.swift (added in Task 1).
+/// Shared by every content search component.
+enum ContentIndexError: Error, LocalizedError {
+    case database(String)
+    var errorDescription: String? { if case .database(let message) = self { return message }; return nil }
+}
 
 /// One unit of searchable text inside a file. `ordinal` orders chunks within the file; `label`
 /// is the human-readable location, such as "第 3 页" or "第 1200 行附近".
@@ -32,6 +36,10 @@ final class ContentIndex {
     static let schemaVersion = 1
 
     let sql: AITopicSQL
+    /// False when the database could not be switched to WAL mode, which some network home
+    /// directories refuse. Indexing still works, but readers and writers serialise instead of
+    /// overlapping. Task 11 logs this.
+    private(set) var usesWAL = true
     private let readOnly: Bool
     private var statements: [String: AITopicStatement] = [:]
     private var inTransaction = false
@@ -71,20 +79,51 @@ final class ContentIndex {
         catch { throw ContentIndexError.database(error.localizedDescription) }
     }
 
+    private func storedVersion() throws -> Int64 {
+        let probe = try sql.prepare("PRAGMA user_version")
+        let hasVersion = try probe.next()
+        let version = hasVersion ? probe.int(0) : 0
+        sqlite3_reset(probe.handle)
+        return version
+    }
+
+    /// `BEGIN IMMEDIATE` returns `SQLITE_BUSY` as soon as another connection holds the write lock;
+    /// the wrapper's 1 s busy timeout does not help with that, so a second instance or an
+    /// `oilfind-cli` launch during a rebuild would fail to open the index at all. Retry briefly.
+    private func beginImmediate() throws {
+        for attempt in 1...10 {
+            do {
+                try sql.run("BEGIN IMMEDIATE")
+                return
+            } catch {
+                guard sqlite3_errcode(sql.db) == SQLITE_BUSY, attempt < 10 else { throw error }
+                Thread.sleep(forTimeInterval: 0.3)
+            }
+        }
+    }
+
     private func migrate() throws {
-        if readOnly { return }
-        // Neither pragma can run inside a transaction.
-        try sql.run("PRAGMA journal_mode=WAL")
+        if readOnly {
+            // A read-only instance must not run against an empty or stale database: every search
+            // would otherwise fail with "no such table: chunks" instead of a clear error.
+            guard try storedVersion() == Int64(Self.schemaVersion) else {
+                throw ContentIndexError.database("Content index is not schema version \(Self.schemaVersion)")
+            }
+            return
+        }
+        // Neither pragma can run inside a transaction. A failed journal_mode change is reported by
+        // returning the current mode rather than by an error, so read the result row: on a network
+        // home directory WAL may be unavailable and indexing must still proceed, just with
+        // serialised readers and writers.
+        let journal = try sql.prepare("PRAGMA journal_mode=WAL")
+        usesWAL = (try journal.next()) && journal.text(0).lowercased() == "wal"
+        sqlite3_reset(journal.handle)
         try sql.run("PRAGMA foreign_keys=ON")
-        // BEGIN IMMEDIATE serialises two writable connections opening the same fresh database:
-        // the loser waits, then sees the winner's version and skips the rebuild.
-        try sql.run("BEGIN IMMEDIATE")
+        // BEGIN IMMEDIATE serialises two writable connections opening the same fresh database: the
+        // loser waits, then re-probes the version below and skips the winner's rebuild.
+        try beginImmediate()
         do {
-            let probe = try sql.prepare("PRAGMA user_version")
-            let hasVersion = try probe.next()
-            let version = hasVersion ? probe.int(0) : 0
-            sqlite3_reset(probe.handle)
-            if version != Int64(Self.schemaVersion) {
+            if try storedVersion() != Int64(Self.schemaVersion) {
                 try sql.run("""
                     DROP TRIGGER IF EXISTS chunk_postings_delete;
                     DROP TABLE IF EXISTS chunk_fts;
@@ -111,8 +150,8 @@ final class ContentIndex {
                         -- UNCOMPRESSED length of folded, so unpack is one exact pass. The bound
                         -- matches ContentCompression.maxBodyBytes.
                         bytes INTEGER NOT NULL CHECK(bytes BETWEEN 0 AND 16777216),
+                        -- Also covers WHERE file=? lookups, so no separate index on (file) is needed.
                         UNIQUE(file, ordinal));
-                    CREATE INDEX chunks_file ON chunks(file);
                     CREATE VIRTUAL TABLE chunk_fts USING fts5(grams, content='', contentless_delete=1, detail=none);
                     -- Postings have no cascade of their own; this covers every path that deletes
                     -- a chunk, including the file cascade.
@@ -131,8 +170,11 @@ final class ContentIndex {
 
     func statement(_ query: String) throws -> AITopicStatement {
         if let existing = statements[query] {
-            // Resetting a statement that an outer loop is iterating would end that loop silently.
-            assert(sqlite3_stmt_busy(existing.handle) == 0, "Re-entrant use of \(query)")
+            // Resetting a statement an outer loop is iterating would end that loop silently, so
+            // this is thrown rather than asserted: asserts are stripped from release builds.
+            guard sqlite3_stmt_busy(existing.handle) == 0 else {
+                throw ContentIndexError.database("Re-entrant use of statement: \(query)")
+            }
             sqlite3_reset(existing.handle); sqlite3_clear_bindings(existing.handle); return existing
         }
         let created = try sql.prepare(query); statements[query] = created; return created
