@@ -373,8 +373,11 @@ git commit -m "feat(content): add content index schema with in-place migration"
 
 **Step 1: 写失败测试**
 
+这些测试**不能用 `index.search`**——`search` 要到 Task 4 才有，用了 Task 3 就永远过不了自己那一步。改直接查 postings 表。
+
 ```swift
 import XCTest
+import SQLite3
 @testable import OilFindApp
 
 final class ContentIndexWriteTests: XCTestCase {
@@ -386,6 +389,14 @@ final class ContentIndexWriteTests: XCTestCase {
     }
     override func tearDownWithError() throws { index = nil; try? FileManager.default.removeItem(at: url) }
 
+    /// Reads the postings table through the index's own connection. `search` does not exist yet.
+    private func ftsRowCount() throws -> Int {
+        let statement = try index.statement("SELECT COUNT(*) FROM chunk_fts")
+        defer { sqlite3_reset(statement.handle) }
+        guard try statement.next() else { return 0 }
+        return Int(statement.int(0))
+    }
+
     func testUpsertIsIdempotentAndBumpsRevision() throws {
         let record = ContentFileRecord(path: "/a/b.pdf", size: 10, mtime: 100, kind: 3, parser: "pdf")
         let first = try index.upsert(file: record)
@@ -394,27 +405,28 @@ final class ContentIndexWriteTests: XCTestCase {
         var changed = record; changed.size = 20
         XCTAssertEqual(try index.upsert(file: changed), first)
         XCTAssertEqual(try index.file(path: "/a/b.pdf")?.revision, 2)
-        XCTAssertEqual(try index.file(path: "/a/b.pdf")?.size, 20)
+        XCTAssertEqual(try index.file(path: "/a/b.pdf")?.record.size, 20)
     }
 
-    func testReplaceChunksDropsOldChunksAndFtsRows() throws {
+    func testReplaceChunksDropsOldChunksAndPostings() throws {
         let id = try index.upsert(file: .init(path: "/a/b.pdf", size: 10, mtime: 100, kind: 3, parser: "pdf"))
         try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "第 1 页", text: "开具发票的日期"),
                                                    .init(ordinal: 1, label: "第 2 页", text: "本月合计")])
         XCTAssertEqual(try index.chunkCount(file: id), 2)
+        XCTAssertEqual(try ftsRowCount(), 2)
         try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "第 1 页", text: "已作废")])
         XCTAssertEqual(try index.chunkCount(file: id), 1)
-        XCTAssertTrue(try index.search("开具发票", limit: 10, isCancelled: { false }).isEmpty)
-        XCTAssertEqual(try index.search("已作废", limit: 10, isCancelled: { false }).count, 1)
+        // Without the explicit postings delete this stays at 2 and leaks for the index's lifetime.
+        XCTAssertEqual(try ftsRowCount(), 1)
     }
 
-    func testRemoveFileCascadesToChunksAndFts() throws {
+    func testRemoveFileCascadesToChunksAndPostings() throws {
         let id = try index.upsert(file: .init(path: "/a/b.txt", size: 10, mtime: 100, kind: 3, parser: "text"))
         try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "第 1 行附近", text: "开具发票的日期")])
         try index.removeFile(path: "/a/b.txt")
         XCTAssertEqual(try index.count(), 0)
         XCTAssertEqual(try index.chunkCount(file: id), 0)
-        XCTAssertTrue(try index.search("开具发票", limit: 10, isCancelled: { false }).isEmpty)
+        XCTAssertEqual(try ftsRowCount(), 0)
     }
 
     func testRemoveFilesByPrefix() throws {
@@ -424,7 +436,8 @@ final class ContentIndexWriteTests: XCTestCase {
         }
         try index.removeFiles(prefix: "/Volumes/X/")
         XCTAssertEqual(try index.count(), 1)
-        XCTAssertEqual(try index.search("开具发票", limit: 10, isCancelled: { false }).count, 1)
+        XCTAssertEqual(try ftsRowCount(), 1)
+        XCTAssertNotNil(try index.file(path: "/Users/me/c.txt"))
     }
 }
 ```
@@ -432,7 +445,7 @@ final class ContentIndexWriteTests: XCTestCase {
 **Step 2: 跑测试确认失败**
 
 Run: `swift test --filter ContentIndexWriteTests`
-Expected: 编译失败，`value of type 'ContentIndex' has no member 'upsert'`
+Expected: 编译失败，`value of type 'ContentIndex' has no member 'upsert'`（同时还会报 `file` / `replaceChunks` / `chunkCount` / `removeFile` / `removeFiles` 的同类错误）
 
 **Step 3: 实现**
 
