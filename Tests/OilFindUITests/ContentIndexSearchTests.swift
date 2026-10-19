@@ -63,4 +63,46 @@ final class ContentIndexSearchTests: XCTestCase {
         XCTAssertEqual(try search("发票", limit: 5).count, 5)
         XCTAssertTrue(try index.search("发票", limit: 5, isCancelled: { true }).isEmpty)
     }
+
+    /// The gram AND is only a filter: `"收据收"` grams to `(收,据)` and `(据,收)`, and `"据收据"`
+    /// contains both bigrams while not containing the literal. The byte scan is what rejects it.
+    func testRejectsGramMatchesThatAreNotLiteral() throws {
+        try store(path: "/a.txt", chunks: [("第 1 行附近", "据收据")])
+        XCTAssertTrue(try search("收据收").isEmpty)
+    }
+
+    /// Same as above in ASCII: `"abcd"` grams to the trigrams `abc` and `bcd`, both present in
+    /// `"abcXbcd"`, whose literal does not contain `"abcd"`.
+    func testRejectsGramMatchesInAsciiText() throws {
+        try store(path: "/a.txt", chunks: [("第 1 行附近", "abcXbcd")])
+        XCTAssertTrue(try search("abcd").isEmpty)
+    }
+
+    /// The pre-loop cancellation check would hide a missing check inside the row loop, so return
+    /// false past it and true partway through: a partial result must not be returned.
+    func testCancellationDuringTheRowLoopReturnsNothing() throws {
+        for i in 0..<3 {
+            try store(path: "/file\(i).txt", chunks: [("第 1 行附近", "发票")])
+        }
+        var calls = 0
+        let hits = try index.search("发票", limit: 10, isCancelled: { calls += 1; return calls > 2 })
+        XCTAssertTrue(hits.isEmpty)
+    }
+
+    func testOrdersHitsByAscendingPath() throws {
+        try store(path: "/z.txt", chunks: [("第 1 行附近", "发票")])
+        try store(path: "/a.txt", chunks: [("第 1 行附近", "发票")])
+        try store(path: "/m.txt", chunks: [("第 1 行附近", "发票")])
+        XCTAssertEqual(try search("发票").map(\.path), ["/a.txt", "/m.txt", "/z.txt"])
+    }
+
+    func testMatchesWhenEveryTermIsPresent() throws {
+        try store(path: "/a.txt", chunks: [("第 1 行附近", "本月开具发票，合计金额")])
+        XCTAssertEqual(try search("发票 合计").count, 1)
+    }
+
+    func testRequiresEveryTermToBePresent() throws {
+        try store(path: "/a.txt", chunks: [("第 1 行附近", "本月开具发票，合计金额")])
+        XCTAssertTrue(try search("发票 收据").isEmpty)
+    }
 }
