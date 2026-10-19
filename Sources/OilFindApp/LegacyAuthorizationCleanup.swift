@@ -1,9 +1,10 @@
 import Foundation
 import LocalAuthentication
 import Security
+import OilFindCore
 
 enum LegacyAuthorizationCleanup {
-    static let completedKey = "legacyAuthorizationCleanupCompleted"
+    static let completedKey = SettingsPreferences.legacyAuthorizationCleanupCompletedKey
     static let keychainService = "com.oiloil.find.trial"
     private static let exactDefaultsKeys = ["trialStartedAt", "trialLastSeenAt", "licenseAPI", "deviceFallbackID"]
 

@@ -19,6 +19,32 @@ public enum SettingsPreferences {
             "sortKey": "relevance", "sortAscending": false
         ])
     }
+    /// The one-time legacy authorization sweep stamps this key when it has run. The sweep itself
+    /// lives in the app layer, but the key is owned here so `clearAll` can protect it without a
+    /// second literal.
+    public static let legacyAuthorizationCleanupCompletedKey = "legacyAuthorizationCleanupCompleted"
+    /// Keys that `clearAll` leaves alone. The three `proEvaluation*` anchors belong to the private
+    /// `Pro/` module, which `OilFindCore` must not depend on, so they stay as literals here — a
+    /// rename there has to be caught in review rather than by the compiler.
+    private static let protectedKeys: Set<String> = [
+        "proEvaluationStartedAt", "proEvaluationLastSeenAt", "proEvaluationEndedAt",
+        legacyAuthorizationCleanupCompletedKey,
+    ]
+    /// Restores every setting to its default. The protected keys survive: wiping the Pro anchors
+    /// would hand out a fresh trial, and wiping the cleanup stamp would re-run a one-time
+    /// migration. Callers must relaunch afterwards — the app holds config snapshots in
+    /// `SettingsModel`, `IndexManager` and the registered hot key, and re-reading all three in
+    /// place is more ways to go wrong than restarting once.
+    public static func clearAll(in defaults: UserDefaults = .standard) {
+        // dictionaryRepresentation() is a union of the application, global and registration
+        // domains; removeObject is a no-op for the global and registration entries, so iterating
+        // the merged dictionary is deliberate — the application domain name is not derivable from
+        // an arbitrary injected UserDefaults. Unlike setExcludedExtensions this posts no
+        // excludedExtensionsChanged notification, which the relaunch contract makes moot.
+        for key in defaults.dictionaryRepresentation().keys where !protectedKeys.contains(key) {
+            defaults.removeObject(forKey: key)
+        }
+    }
     public static func searchOptions(in defaults: UserDefaults = .standard) -> SearchOptions {
         let key: SortKey
         switch defaults.string(forKey: "sortKey") {
