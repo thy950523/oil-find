@@ -84,4 +84,68 @@ final class TextParserTests: XCTestCase {
             }
         }
     }
+
+    func testCancellationThrowsRatherThanReturningAnEmptyResult() throws {
+        // `[]` means "parsed, genuinely no text", which makes the indexer clear the file's rows and
+        // stop retrying it. Cancellation must throw instead, so the existing rows survive. Flip the
+        // flag after the pre-decode check so the in-loop throw is the one exercised.
+        let lines = (1...50).map { "line \($0)" }
+        let url = try write(Data(lines.joined(separator: "\n").utf8), name: "cancel.txt")
+        var calls = 0
+        let isCancelled = { () -> Bool in calls += 1; return calls > 1 }
+
+        XCTAssertThrowsError(try TextParser().parse(url: url, budget: budget, isCancelled: isCancelled)) { error in
+            guard case ContentParserError.cancelled = error else {
+                return XCTFail("expected cancelled, got \(error)")
+            }
+        }
+    }
+
+    func testSingleOverlongLineIsSplitIntoBoundedChunks() throws {
+        // One line with no newline at all. The old flush-before-append test never split it: the
+        // buffer was empty on entry, nothing flushed, and the whole line became one chunk. A line
+        // past 16 MiB then made `replaceChunks` throw and abort the entire sync.
+        let line = String(repeating: "发票", count: 2_000)  // 12 000 bytes, over the 1 KiB budget
+        let url = try write(Data(line.utf8), name: "oneline.txt")
+
+        let chunks = try TextParser(chunkBytes: 1024).parse(url: url, budget: budget, isCancelled: { false })
+
+        XCTAssertGreaterThan(chunks.count, 1)
+        for chunk in chunks {
+            XCTAssertLessThanOrEqual(chunk.text.utf8.count, 1024)
+            // Every piece comes from the same line, so they all share its label.
+            XCTAssertEqual(chunk.label, "第 1 行附近")
+        }
+        // Splitting cuts the line, it does not drop or reorder any of it.
+        XCTAssertEqual(chunks.map(\.text).joined(), line)
+    }
+
+    func testCRLFDoesNotBecomeOneChunk() throws {
+        // Swift reads "\r\n" as a single Character, so a "\n"-only split never breaks a CRLF file:
+        // it stays one chunk and every label reads 第 1 行. A small budget makes the line labels
+        // observable. The BOM is also checked because it must never surface in the text.
+        var data = Data([0xEF, 0xBB, 0xBF])
+        data.append(Data((1...5).map { "line \($0) 发票" }.joined(separator: "\r\n").utf8))
+        let url = try write(data, name: "crlf.txt")
+
+        let chunks = try TextParser(chunkBytes: 24).parse(url: url, budget: budget, isCancelled: { false })
+
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertFalse(chunks.allSatisfy { $0.label == "第 1 行附近" })
+        for chunk in chunks {
+            XCTAssertFalse(chunk.text.contains("\u{FEFF}"))
+            XCTAssertFalse(chunk.text.contains("\r\n"))
+        }
+    }
+
+    func testClassicMacLineEndingsProduceDistinctLabels() throws {
+        // A lone-"\r" file is one line under a "\n"-only split, so every chunk would read 第 1 行.
+        let body = (1...5).map { "line \($0) 发票" }.joined(separator: "\r")
+        let url = try write(Data(body.utf8), name: "cr.txt")
+
+        let chunks = try TextParser(chunkBytes: 24).parse(url: url, budget: budget, isCancelled: { false })
+
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertFalse(chunks.allSatisfy { $0.label == "第 1 行附近" })
+    }
 }
