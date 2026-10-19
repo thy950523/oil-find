@@ -26,6 +26,17 @@ struct ContentFileRecord {
     let parser: String
 }
 
+/// A verified content match inside one file. `path` is the absolute path, never an entry id: the
+/// file index renumbers entry ids on compaction, so a stored id would point at another file.
+struct ContentHit {
+    let path: String
+    /// File-index kind (3 = document, 4 = image); the provider uses it to decide thumbnails.
+    let kind: UInt8
+    let label: String
+    let snippet: String
+    let highlights: [NSRange]
+}
+
 /// A read-only or read-write connection. Each connection is confined to its caller's queue.
 final class ContentIndex {
     static let defaultURL = FileManager.default.homeDirectoryForCurrentUser
@@ -356,5 +367,136 @@ extension ContentIndex {
             try? run("ROLLBACK")
             throw error
         }
+    }
+}
+
+extension ContentIndex {
+    /// Finds the files whose text contains every whitespace-separated term in `text`. The gram
+    /// postings only narrow the candidate set, so every candidate is verified byte by byte before
+    /// it is returned. Cancellation returns nothing rather than a partial result.
+    func search(_ text: String, limit: Int, isCancelled: () -> Bool) throws -> [ContentHit] {
+        let terms = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard limit > 0, !terms.isEmpty else { return [] }
+        // The body is stored folded, so the terms must be folded before they are grammed or matched;
+        // otherwise the match would be case-sensitive.
+        let folded = terms.map { AITopicIndex.fold($0) }
+        // Grams of every term, ANDed together. This is only a superset filter: the AND admits
+        // false positives across grams and across chunks, which the byte scan below removes.
+        let query = Set(try folded.flatMap { term in
+            try AITopicIndex.grams(term, query: true, checkpoint: nil).components(separatedBy: " AND ")
+        }).sorted().joined(separator: " AND ")
+        guard !query.isEmpty else { return [] }
+        if isCancelled() { return [] }
+
+        let statement = try statement("""
+            SELECT c.id, f.path, f.kind, c.ordinal, c.label, c.folded, c.bytes
+            FROM chunk_fts JOIN chunks c ON c.id = chunk_fts.rowid
+                           JOIN files f ON f.id = c.file
+            WHERE chunk_fts MATCH ?
+            ORDER BY rank
+            """)
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([query])
+
+        let needles = folded.map { [UInt8]($0.utf8) }
+        var best: [String: ContentHit] = [:]
+        var bestHighlights: [String: Int] = [:]
+        while try step(statement) {
+            if isCancelled() { return [] }
+            // A NULL or undecodable body is skipped rather than fatal: one damaged chunk must not
+            // abort the whole query.
+            guard let body = try? ContentCompression.unpack(blob(statement, 5), bytes: Int(statement.int(6)))
+            else { continue }
+            let haystack = [UInt8](body)
+            // Every term must literally occur, so a row matched only by the gram AND is rejected.
+            var matchesAll = true
+            for needle in needles where Self.byteRanges(of: needle, in: haystack).isEmpty {
+                matchesAll = false
+                break
+            }
+            guard matchesAll else { continue }
+
+            let path = statement.text(1)
+            let snippet = Self.snippet(text: String(decoding: body, as: UTF8.self), terms: folded)
+            // One row per file: keep the chunk carrying the most highlights.
+            if snippet.highlights.count > (bestHighlights[path] ?? -1) {
+                best[path] = ContentHit(path: path,
+                                        kind: UInt8(truncatingIfNeeded: statement.int(2)),
+                                        label: statement.text(4),
+                                        snippet: snippet.text,
+                                        highlights: snippet.highlights)
+                bestHighlights[path] = snippet.highlights.count
+            }
+            if best.count >= limit { break }
+        }
+        return best.values.sorted { $0.path < $1.path }
+    }
+
+    /// Non-overlapping occurrences of `needle` in `haystack`. A valid UTF-8 lead byte is never a
+    /// continuation byte, so a match can never start in the middle of a multi-byte scalar.
+    private static func byteRanges(of needle: [UInt8], in haystack: [UInt8]) -> [Range<Int>] {
+        guard !needle.isEmpty, needle.count <= haystack.count else { return [] }
+        var result: [Range<Int>] = []
+        var i = 0
+        let last = haystack.count - needle.count
+        while i <= last {
+            if haystack[i] == needle[0] {
+                var j = 1
+                while j < needle.count, haystack[i + j] == needle[j] { j += 1 }
+                if j == needle.count {
+                    result.append(i ..< i + needle.count)
+                    // Non-overlapping: resume after the hit rather than one byte past it.
+                    i += needle.count
+                    continue
+                }
+            }
+            i += 1
+        }
+        return result
+    }
+
+    /// A window of `text` centred on the first term, with the ranges of every term inside it.
+    /// `before` and `after` are UTF-16 units, and the ranges are UTF-16 offsets into the decoded
+    /// string: byte offsets do not map linearly onto them. At most 20 highlights are collected,
+    /// and only those that fall inside the displayed window are kept.
+    private static func snippet(text: String, terms: [String], before: Int = 40, after: Int = 60)
+        -> (text: String, highlights: [NSRange]) {
+        let ns = text as NSString
+        let length = ns.length
+        guard length > 0 else { return ("", []) }
+        var first = Int.max
+        for term in terms where !term.isEmpty {
+            let found = ns.range(of: term)
+            if found.location != NSNotFound, found.location < first { first = found.location }
+        }
+        guard first != Int.max else { return ("", []) }
+        let start = max(0, first - before)
+        let end = min(length, first + after)
+        let window = NSRange(location: start, length: end - start)
+        var highlights: [NSRange] = []
+        for term in terms where !term.isEmpty {
+            var search = NSRange(location: 0, length: length)
+            while highlights.count < 20 {
+                let found = ns.range(of: term, options: [], range: search)
+                if found.location == NSNotFound { break }
+                if found.location >= start, NSMaxRange(found) <= end {
+                    highlights.append(NSRange(location: found.location - start, length: found.length))
+                }
+                let next = NSMaxRange(found)
+                if next <= search.location { break }
+                search = NSRange(location: next, length: length - next)
+            }
+            if highlights.count >= 20 { break }
+        }
+        highlights.sort { $0.location < $1.location }
+        return (ns.substring(with: window), highlights)
+    }
+
+    /// `folded` is `BLOB NOT NULL`, so a NULL here means a corrupt row: return empty data, which
+    /// `unpack` rejects, so the row is skipped instead of aborting the query.
+    private func blob(_ statement: AITopicStatement, _ column: Int32) -> Data {
+        guard sqlite3_column_type(statement.handle, column) != SQLITE_NULL,
+              let bytes = sqlite3_column_blob(statement.handle, column) else { return Data() }
+        return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement.handle, column)))
     }
 }
