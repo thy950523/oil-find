@@ -1863,7 +1863,11 @@ final class ContentManager: ObservableObject {
 
     private let defaults: UserDefaults
     private let indexURL: URL?
-    private let store: ContentIndex?
+    /// Two connections on the same WAL database: a SQLite connection must never be used from two
+    /// threads, and the indexer writes while the search provider reads. Opening the writer first
+    /// also creates and migrates the schema that the read-only connection needs.
+    private let writer: ContentIndex?
+    private let reader: ContentIndex?
     private let indexer: ContentIndexer?
     private let queue = DispatchQueue(label: "com.oiloil.find.content.index", qos: .utility)
     private let lock = NSLock()
@@ -1875,14 +1879,18 @@ final class ContentManager: ObservableObject {
     init(defaults: UserDefaults = .standard, indexURL: URL? = ContentIndex.defaultURL) {
         self.defaults = defaults
         self.indexURL = indexURL
-        let store = indexURL.flatMap { try? ContentIndex(url: $0) }
-        self.store = store
-        self.indexer = store.map { ContentIndexer(index: $0, parsers: [TextParser(), ImageOCRParser()]) }
+        let writer = indexURL.flatMap { try? ContentIndex(url: $0) }
+        let reader = indexURL.flatMap { try? ContentIndex(url: $0, readOnly: true) }
+        self.writer = writer
+        self.reader = reader
+        self.indexer = writer.map { ContentIndexer(index: $0, parsers: [TextParser(), ImageOCRParser()]) }
         let enabled = defaults.bool(forKey: Self.enabledKey)
         self.enabled = enabled
-        self.provider = ContentSearchProvider(index: store)
+        self.provider = ContentSearchProvider(index: reader)
         self.provider.isEnabled = enabled
-        refresh()
+        // Nothing else is running yet, so reading the writer here cannot race.
+        count = (try? writer?.count()) ?? 0
+        diskBytes = Self.diskBytes(at: indexURL)
     }
 
     func setEnabled(_ value: Bool) {
@@ -1913,7 +1921,8 @@ final class ContentManager: ObservableObject {
                 catch { hardFailure = true }
             }
             let failed = indexer.failedCount + (hardFailure ? 1 : 0)
-            let count = (try? self.store?.count()) ?? 0
+            // Read on the writer's queue, where no other statement on that connection can run.
+            let count = (try? self.writer?.count()) ?? 0
             DispatchQueue.main.async {
                 guard !self.isCancelled(mine) else { return }
                 self.indexing = false
@@ -1927,12 +1936,20 @@ final class ContentManager: ObservableObject {
     /// Invalidates the in-flight run. The worker checks `isCancelled` between files and stops.
     func stop() { lock.lock(); generation += 1; cancelled = true; lock.unlock() }
 
-    func rebuild() { stop(); try? store?.clear(); refresh(); start() }
-    func clear() { stop(); try? store?.clear(); refresh() }
+    /// Both go through the same serial queue as the indexer, so a delete can never overlap a sync.
+    func clear() { stop(); enqueueClear() }
+    func rebuild() { clear(); start() }
 
-    private func refresh() {
-        count = (try? store?.count()) ?? 0
-        diskBytes = Self.diskBytes(at: indexURL)
+    private func enqueueClear() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            try? self.writer?.clear()
+            let count = (try? self.writer?.count()) ?? 0
+            DispatchQueue.main.async {
+                self.count = count
+                self.diskBytes = Self.diskBytes(at: self.indexURL)
+            }
+        }
     }
 
     private func isCancelled(_ mine: Int) -> Bool {
