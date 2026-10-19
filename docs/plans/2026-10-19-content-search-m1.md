@@ -1,0 +1,1615 @@
+# 内容搜索 M1 实施计划（内核 + 图片 OCR + 纯文本）
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** 让 Oil Find 能按图片里的文字和纯文本/Markdown 文件里的文字搜索，命中挂到文件行上并高亮。
+
+**Architecture:** 新建 `Sources/OilFindApp/ContentSearch/`，与 `AITopics/` 平级，同在 `OilFindApp` module 内，直接复用其 SQLite 封装、gram 生成与 CPU 预算。独立一个 SQLite 库存 `files` / `chunks` / `chunk_fts`。查询时从 gram 索引取候选、逐字节字面验证，再把文件**路径**解析成文件索引当前的 entryID，通过 `SupplementarySearchProvider` 挂到结果行。
+
+**Tech Stack:** Swift 5、SQLite3（系统库）、Vision、AppKit、XCTest。不引第三方包。
+
+**设计依据:** `docs/plans/2026-10-19-content-search-design.md`
+
+---
+
+## 开工前必读
+
+- 分支：`feat/content-search`
+- 关键约束：**内容索引存绝对路径，不存 entryID**。`compacted()` 会重排 entryID（`IndexStore+Mutation.swift:175-199`），存 id 会导致命中挂到错误文件上。理由见设计文档第 2 节。
+- 每完成一个 Task 都要跑一次免费版回归闸门。
+- 测试放 `Tests/OilFindUITests/`（代码在 `OilFindApp` 内，需要 `@testable import OilFindApp`）。
+
+## 验证命令
+
+```sh
+swift build
+swift test --filter ContentSearch
+OILFIND_FREE=1 swift build
+OILFIND_FREE=1 swift test --filter ContentSearch
+python3 Tests/Scripts/test_open_core.py
+```
+
+---
+
+## Task 1: 放开 gram 的让出变体 + 压缩辅助
+
+大文档构造 gram 时必须在块之间让出 CPU，但带 `checkpoint` 的重载是 `private`（`AITopicIndex.swift:193`）。改可见性即可，不动任何调用点。
+
+**Files:**
+- Modify: `Sources/OilFindApp/AITopics/AITopicIndex.swift:193`
+- Create: `Sources/OilFindApp/ContentSearch/Support/Compression.swift`
+- Test: `Tests/OilFindUITests/ContentSearchSupportTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+@testable import OilFindApp
+
+final class ContentSearchSupportTests: XCTestCase {
+    func testCompressionRoundTrips() throws {
+        for text in ["", "收据", String(repeating: "开具发票的日期 ", count: 5000),
+                     String((0..<4096).map { _ in Character(UnicodeScalar(UInt8.random(in: 32...126))) })] {
+            let raw = Data(text.utf8)
+            XCTAssertEqual(try Compression.unpack(Compression.pack(raw)), raw)
+        }
+    }
+    func testGramCheckpointIsCalledAndCancellationPropagates() throws {
+        var calls = 0
+        let text = String(repeating: "发票 ", count: 20000)
+        _ = try AITopicIndex.grams(text, checkpoint: { calls += 1 })
+        XCTAssertGreaterThan(calls, 0)
+        XCTAssertThrowsError(try AITopicIndex.grams(text, checkpoint: { throw CancellationError() }))
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ContentSearchSupportTests`
+Expected: 编译失败，`cannot find 'Compression' in scope`
+
+**Step 3: 实现**
+
+`AITopicIndex.swift:193` 去掉 `private`：
+
+```swift
+    static func grams(_ text: String, query: Bool = false, checkpoint: (() throws -> Void)?) throws -> String {
+```
+
+新建 `Sources/OilFindApp/ContentSearch/Support/Compression.swift`：
+
+```swift
+import Foundation
+
+/// ZLIB for stored bodies, LZFSE for verification documents, matching the AI topic index.
+/// A leading byte records the codec so the format can change without a migration.
+enum Compression {
+    private enum Codec: UInt8 { case raw = 0, zlib = 1, lzfse = 2 }
+
+    static func pack(_ data: Data, compact: Bool = false) -> Data {
+        guard !data.isEmpty else { return Data([Codec.raw.rawValue]) }
+        var output = Data(count: data.count)
+        let written = output.withUnsafeMutableBytes { destination in
+            data.withUnsafeBytes { source in
+                compression_encode_buffer(destination.bindMemory(to: UInt8.self).baseAddress!, output.count,
+                                          source.bindMemory(to: UInt8.self).baseAddress!, data.count, nil,
+                                          compact ? COMPRESSION_ZLIB : COMPRESSION_LZFSE)
+            }
+        }
+        guard written > 0, written < data.count else { return Data([Codec.raw.rawValue]) + data }
+        output.count = written
+        return Data([(compact ? Codec.zlib : Codec.lzfse).rawValue]) + output
+    }
+
+    static func unpack(_ data: Data) throws -> Data {
+        guard let codec = data.first.flatMap(Codec.init(rawValue:)) else { throw ContentIndexError.database("Empty compressed body") }
+        let body = data.dropFirst()
+        guard codec != .raw else { return Data(body) }
+        // The stored size is unknown; grow until the decoder stops reporting a short buffer.
+        var capacity = max(1024, body.count * 4)
+        while capacity <= 256 * 1024 * 1024 {
+            var output = Data(count: capacity)
+            let written = output.withUnsafeMutableBytes { destination in
+                body.withUnsafeBytes { source in
+                    compression_decode_buffer(destination.bindMemory(to: UInt8.self).baseAddress!, capacity,
+                                              source.bindMemory(to: UInt8.self).baseAddress!, body.count, nil,
+                                              codec == .zlib ? COMPRESSION_ZLIB : COMPRESSION_LZFSE)
+                }
+            }
+            if written > 0 && written < capacity { output.count = written; return output }
+            capacity *= 4
+        }
+        throw ContentIndexError.database("Cannot decompress body")
+    }
+}
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ContentSearchSupportTests`
+Expected: PASS
+
+**Step 5: 确认没有打破 AITopics**
+
+Run: `swift test --filter AITopic`
+Expected: 全部 PASS
+
+**Step 6: 提交**
+
+```sh
+git add Sources/OilFindApp/AITopics/AITopicIndex.swift Sources/OilFindApp/ContentSearch/Support/Compression.swift Tests/OilFindUITests/ContentSearchSupportTests.swift
+git commit -m "feat(content): add compression helper and expose gram checkpoints"
+```
+
+---
+
+## Task 2: 内容索引的表结构与迁移
+
+**Files:**
+- Create: `Sources/OilFindApp/ContentSearch/ContentIndex.swift`
+- Test: `Tests/OilFindUITests/ContentIndexSchemaTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+@testable import OilFindApp
+
+final class ContentIndexSchemaTests: XCTestCase {
+    private func tempURL() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("content-" + UUID().uuidString + ".sqlite")
+    }
+    func testOpenCreatesTablesAndIsIdempotent() throws {
+        let url = tempURL(); defer { try? FileManager.default.removeItem(at: url) }
+        do { _ = try ContentIndex(url: url) }
+        let index = try ContentIndex(url: url)
+        let sql = try AITopicSQL(url, readOnly: true)
+        XCTAssertEqual(try sql.tables().intersection(["files", "chunks"]), ["files", "chunks"])
+        XCTAssertTrue(try sql.tables().contains("chunk_fts"))
+        XCTAssertEqual(try index.count(), 0)
+    }
+    func testMissingColumnsAreAddedOnOpen() throws {
+        let url = tempURL(); defer { try? FileManager.default.removeItem(at: url) }
+        do { let sql = try AITopicSQL(url); try sql.run("CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE)") }
+        _ = try ContentIndex(url: url)
+        let sql = try AITopicSQL(url, readOnly: true)
+        XCTAssertTrue(try sql.columns("files").isSuperset(of: ["size", "mtime", "kind", "parser", "revision"]))
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ContentIndexSchemaTests`
+Expected: 编译失败，`cannot find 'ContentIndex' in scope`
+
+**Step 3: 实现**
+
+新建 `Sources/OilFindApp/ContentSearch/ContentIndex.swift`：
+
+```swift
+import Foundation
+import SQLite3
+
+enum ContentIndexError: Error, LocalizedError {
+    case database(String)
+    var errorDescription: String? { if case .database(let message) = self { return message }; return nil }
+}
+
+struct ContentChunk {
+    let ordinal: Int
+    let label: String
+    let text: String
+}
+
+struct ContentFileRecord {
+    let path: String
+    let size: Int64
+    let mtime: Int64
+    let kind: UInt8
+    let parser: String
+}
+
+/// A read-only or read-write connection. Each connection is confined to its caller's queue.
+final class ContentIndex {
+    static let defaultURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Oil Find/content/index.sqlite")
+
+    let sql: AITopicSQL
+    private let readOnly: Bool
+    private var statements: [String: AITopicStatement] = [:]
+    private var inTransaction = false
+
+    init(url: URL, readOnly: Bool = false) throws {
+        self.readOnly = readOnly
+        if !readOnly {
+            let directory = url.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
+        }
+        sql = try AITopicSQL(url, readOnly: readOnly)
+        if !readOnly {
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
+        try migrate()
+    }
+
+    private func migrate() throws {
+        if readOnly { return }
+        try sql.run("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA foreign_keys=ON;
+            CREATE TABLE IF NOT EXISTS files(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER NOT NULL,
+                mtime INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                parser TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS chunks(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                folded BLOB NOT NULL,
+                bytes INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file);
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(grams, content='', contentless_delete=1, detail=none);
+            """)
+        // In-place migration for databases written by earlier builds.
+        let columns = try sql.columns("files")
+        for (name, definition) in [("size", "INTEGER NOT NULL DEFAULT 0"), ("mtime", "INTEGER NOT NULL DEFAULT 0"),
+                                   ("kind", "INTEGER NOT NULL DEFAULT 0"), ("parser", "TEXT NOT NULL DEFAULT ''"),
+                                   ("revision", "INTEGER NOT NULL DEFAULT 1")] where !columns.contains(name) {
+            try sql.run("ALTER TABLE files ADD COLUMN \(name) \(definition)")
+        }
+    }
+
+    func statement(_ query: String) throws -> AITopicStatement {
+        if let existing = statements[query] { sqlite3_reset(existing.handle); sqlite3_clear_bindings(existing.handle); return existing }
+        let created = try sql.prepare(query); statements[query] = created; return created
+    }
+
+    func count() throws -> Int {
+        let statement = try statement("SELECT COUNT(*) FROM files")
+        defer { sqlite3_reset(statement.handle) }
+        guard try statement.next() else { return 0 }
+        return Int(statement.int(0))
+    }
+}
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ContentIndexSchemaTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/ContentIndex.swift Tests/OilFindUITests/ContentIndexSchemaTests.swift
+git commit -m "feat(content): add content index schema with in-place migration"
+```
+
+---
+
+## Task 3: 写入文件与块
+
+**Files:**
+- Modify: `Sources/OilFindApp/ContentSearch/ContentIndex.swift`
+- Test: `Tests/OilFindUITests/ContentIndexWriteTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+@testable import OilFindApp
+
+final class ContentIndexWriteTests: XCTestCase {
+    private var url: URL!
+    private var index: ContentIndex!
+    override func setUpWithError() throws {
+        url = FileManager.default.temporaryDirectory.appendingPathComponent("content-" + UUID().uuidString + ".sqlite")
+        index = try ContentIndex(url: url)
+    }
+    override func tearDownWithError() throws { index = nil; try? FileManager.default.removeItem(at: url) }
+
+    func testUpsertIsIdempotentAndBumpsRevision() throws {
+        let record = ContentFileRecord(path: "/a/b.pdf", size: 10, mtime: 100, kind: 3, parser: "pdf")
+        let first = try index.upsert(file: record)
+        XCTAssertEqual(try index.upsert(file: record), first)
+        XCTAssertEqual(try index.count(), 1)
+        var changed = record; changed.size = 20
+        XCTAssertEqual(try index.upsert(file: changed), first)
+        XCTAssertEqual(try index.file(path: "/a/b.pdf")?.revision, 2)
+        XCTAssertEqual(try index.file(path: "/a/b.pdf")?.size, 20)
+    }
+
+    func testReplaceChunksDropsOldChunksAndFtsRows() throws {
+        let id = try index.upsert(file: .init(path: "/a/b.pdf", size: 10, mtime: 100, kind: 3, parser: "pdf"))
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "第 1 页", text: "开具发票的日期"),
+                                                   .init(ordinal: 1, label: "第 2 页", text: "本月合计")])
+        XCTAssertEqual(try index.chunkCount(file: id), 2)
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "第 1 页", text: "已作废")])
+        XCTAssertEqual(try index.chunkCount(file: id), 1)
+        XCTAssertTrue(try index.search("开具发票", limit: 10, isCancelled: { false }).isEmpty)
+        XCTAssertEqual(try index.search("已作废", limit: 10, isCancelled: { false }).count, 1)
+    }
+
+    func testRemoveFileCascadesToChunksAndFts() throws {
+        let id = try index.upsert(file: .init(path: "/a/b.txt", size: 10, mtime: 100, kind: 3, parser: "text"))
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "第 1 行附近", text: "开具发票的日期")])
+        try index.removeFile(path: "/a/b.txt")
+        XCTAssertEqual(try index.count(), 0)
+        XCTAssertEqual(try index.chunkCount(file: id), 0)
+        XCTAssertTrue(try index.search("开具发票", limit: 10, isCancelled: { false }).isEmpty)
+    }
+
+    func testRemoveFilesByPrefix() throws {
+        for path in ["/Volumes/X/a.txt", "/Volumes/X/b.txt", "/Users/me/c.txt"] {
+            let id = try index.upsert(file: .init(path: path, size: 1, mtime: 1, kind: 3, parser: "text"))
+            try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        }
+        try index.removeFiles(prefix: "/Volumes/X/")
+        XCTAssertEqual(try index.count(), 1)
+        XCTAssertEqual(try index.search("开具发票", limit: 10, isCancelled: { false }).count, 1)
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ContentIndexWriteTests`
+Expected: 编译失败，`value of type 'ContentIndex' has no member 'upsert'`
+
+**Step 3: 实现**
+
+追加到 `ContentIndex.swift`：
+
+```swift
+extension ContentIndex {
+    func file(path: String) throws -> (record: ContentFileRecord, id: Int64, revision: Int64)? {
+        let statement = try statement("SELECT id, size, mtime, kind, parser, revision FROM files WHERE path=?")
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([path])
+        guard try statement.next() else { return nil }
+        let record = ContentFileRecord(path: path, size: statement.int(1), mtime: statement.int(2),
+                                       kind: UInt8(truncatingIfNeeded: statement.int(3)), parser: statement.text(4))
+        return (record, statement.int(0), statement.int(5))
+    }
+
+    func file(path: String) throws -> (size: Int64, revision: Int64)? {
+        try file(path: path).map { ($0.record.size, $0.revision) }
+    }
+
+    @discardableResult
+    func upsert(file record: ContentFileRecord) throws -> Int64 {
+        if let existing = try file(path: record.path) {
+            guard existing.record.size != record.size || existing.record.mtime != record.mtime
+                || existing.record.parser != record.parser else { return existing.id }
+            let statement = try statement("UPDATE files SET size=?, mtime=?, kind=?, parser=?, revision=revision+1 WHERE id=?")
+            defer { sqlite3_reset(statement.handle) }
+            statement.bind([String(record.size), String(record.mtime), String(record.kind), record.parser, String(existing.id)])
+            _ = try statement.next()
+            return existing.id
+        }
+        let statement = try statement("INSERT INTO files(path,size,mtime,kind,parser) VALUES(?,?,?,?,?)")
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([record.path, String(record.size), String(record.mtime), String(record.kind), record.parser])
+        _ = try statement.next()
+        return sqlite3_last_insert_rowid(sql.db)
+    }
+
+    func replaceChunks(file id: Int64, chunks: [ContentChunk]) throws {
+        try transaction {
+            let drop = try statement("DELETE FROM chunks WHERE file=?")
+            drop.bind([String(id)]); _ = try drop.next(); sqlite3_reset(drop.handle)
+            let insert = try statement("INSERT INTO chunks(file,ordinal,label,folded,bytes) VALUES(?,?,?,?,?)")
+            let fts = try statement("INSERT INTO chunk_fts(rowid,grams) VALUES(?,?)")
+            for chunk in chunks {
+                let folded = Data(AITopicIndex.fold(chunk.text).utf8)
+                let packed = Compression.pack(folded, compact: true)
+                insert.bind([String(id), String(chunk.ordinal), chunk.label, ""])
+                _ = try insert.next()
+                let rowid = sqlite3_last_insert_rowid(sql.db)
+                sqlite3_reset(insert.handle)
+                let update = try statement("UPDATE chunks SET folded=?, bytes=? WHERE id=?")
+                update.bind([String(rowid), String(packed.count)])
+                sqlite3_bind_blob(update.handle, 1, [UInt8](packed), Int32(packed.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                _ = try update.next(); sqlite3_reset(update.handle)
+                let grams = try AITopicIndex.grams(chunk.text, checkpoint: nil)
+                fts.bind([String(rowid), grams]); _ = try fts.next(); sqlite3_reset(fts.handle)
+            }
+        }
+    }
+
+    func chunkCount(file id: Int64) throws -> Int {
+        let statement = try statement("SELECT COUNT(*) FROM chunks WHERE file=?")
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([String(id)])
+        guard try statement.next() else { return 0 }
+        return Int(statement.int(0))
+    }
+
+    func removeFile(path: String) throws {
+        try transaction {
+            guard let existing = try file(path: path) else { return }
+            let select = try statement("SELECT id FROM chunks WHERE file=?")
+            select.bind([String(existing.id)])
+            var ids: [Int64] = []
+            while try select.next() { ids.append(select.int(0)) }
+            sqlite3_reset(select.handle)
+            for rowid in ids {
+                let fts = try statement("DELETE FROM chunk_fts WHERE rowid=?")
+                fts.bind([String(rowid)]); _ = try fts.next(); sqlite3_reset(fts.handle)
+            }
+            let drop = try statement("DELETE FROM files WHERE id=?")
+            drop.bind([String(existing.id)]); _ = try drop.next(); sqlite3_reset(drop.handle)
+        }
+    }
+
+    func removeFiles(prefix: String) throws {
+        let statement = try statement("SELECT path FROM files WHERE path LIKE ? ESCAPE '\\'")
+        defer { sqlite3_reset(statement.handle) }
+        let escaped = prefix.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
+        statement.bind([escaped + "%"])
+        var paths: [String] = []
+        while try statement.next() { paths.append(statement.text(0)) }
+        for path in paths { try removeFile(path: path) }
+    }
+
+    func transaction(_ work: () throws -> Void) throws {
+        if inTransaction { try work(); return }
+        inTransaction = true
+        try sql.run("BEGIN IMMEDIATE")
+        do { try work(); try sql.run("COMMIT") }
+        catch { try? sql.run("ROLLBACK"); inTransaction = false; throw error }
+        inTransaction = false
+    }
+}
+```
+
+注意：`replaceChunks` 里的 blob 绑定写法在实现时统一成一个小 helper（`bindBlob(_:at:into:)`），别重复三遍。`DELETE FROM chunk_fts` 是 `contentless_delete=1` 表支持的写法；如果实测报错，改用 `INSERT INTO chunk_fts(chunk_fts, rowid, grams) VALUES('delete', ?, ?)` 并带上原 grams。
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ContentIndexWriteTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/ContentIndex.swift Tests/OilFindUITests/ContentIndexWriteTests.swift
+git commit -m "feat(content): store files and chunks with cascade delete"
+```
+
+---
+
+## Task 4: 检索与字面验证
+
+gram 检索会给出跨 gram 的假阳性，必须逐字节字面验证候选。
+
+**Files:**
+- Modify: `Sources/OilFindApp/ContentSearch/ContentIndex.swift`
+- Test: `Tests/OilFindUITests/ContentIndexSearchTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+@testable import OilFindApp
+
+final class ContentIndexSearchTests: XCTestCase {
+    private var url: URL!
+    private var index: ContentIndex!
+    override func setUpWithError() throws {
+        url = FileManager.default.temporaryDirectory.appendingPathComponent("content-" + UUID().uuidString + ".sqlite")
+        index = try ContentIndex(url: url)
+    }
+    override func tearDownWithError() throws { index = nil; try? FileManager.default.removeItem(at: url) }
+
+    private func add(_ path: String, chunks: [(Int, String, String)]) throws {
+        let id = try index.upsert(file: .init(path: path, size: 1, mtime: 1, kind: 3, parser: "text"))
+        try index.replaceChunks(file: id, chunks: chunks.map { .init(ordinal: $0.0, label: $0.1, text: $0.2) })
+    }
+
+    func testFindsChineseSubstringWithLabelAndHighlight() throws {
+        try add("/a/report.pdf", chunks: [(2, "第 3 页", "本月开具发票的日期是三月五日")])
+        let hits = try index.search("发票", limit: 10, isCancelled: { false })
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(hits[0].path, "/a/report.pdf")
+        XCTAssertEqual(hits[0].label, "第 3 页")
+        let snippet = hits[0].snippet as NSString
+        XCTAssertEqual(snippet.substring(with: hits[0].highlights[0]), "发票")
+    }
+
+    func testIsCaseInsensitiveAndFindsEnglish() throws {
+        try add("/a/invoice.md", chunks: [(0, "第 1 行附近", "Invoice #1234 due Friday")])
+        XCTAssertEqual(try index.search("invoice", limit: 10, isCancelled: { false }).count, 1)
+        XCTAssertEqual(try index.search("INVOICE", limit: 10, isCancelled: { false }).count, 1)
+    }
+
+    func testDoesNotReportMatchesThatOnlyExistAcrossChunkBoundaries() throws {
+        try add("/a/split.txt", chunks: [(0, "第 1 行附近", "本月的收"), (1, "第 900 行附近", "据已经归档")])
+        XCTAssertTrue(try index.search("收据", limit: 10, isCancelled: { false }).isEmpty)
+    }
+
+    func testReturnsEachFileOnceWithItsBestChunk() throws {
+        try add("/a/many.txt", chunks: [(0, "第 1 行附近", "发票"), (1, "第 500 行附近", "发票 发票 发票")])
+        let hits = try index.search("发票", limit: 10, isCancelled: { false })
+        XCTAssertEqual(hits.count, 1)
+    }
+
+    func testRespectsLimitAndCancellation() throws {
+        for i in 0..<20 { try add("/a/\(i).txt", chunks: [(0, "第 1 行附近", "开具发票的日期")]) }
+        XCTAssertEqual(try index.search("发票", limit: 5, isCancelled: { false }).count, 5)
+        XCTAssertTrue(try index.search("发票", limit: 5, isCancelled: { true }).isEmpty)
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ContentIndexSearchTests`
+Expected: 编译失败，`has no member 'search'`
+
+**Step 3: 实现**
+
+追加到 `ContentIndex.swift`：
+
+```swift
+struct ContentHit {
+    let path: String
+    let label: String
+    let snippet: String
+    let highlights: [NSRange]
+}
+
+extension ContentIndex {
+    /// Candidates come from the gram index; every candidate is then verified byte by byte so
+    /// matches spanning two grams or two chunks are never reported.
+    func search(_ text: String, limit: Int, isCancelled: () -> Bool) throws -> [ContentHit] {
+        let needle = Array(AITopicIndex.fold(text).utf8)
+        guard !needle.isEmpty, limit > 0 else { return [] }
+        let terms = Array(Set(AITopicIndex.fold(text).split(whereSeparator: { $0.isWhitespace }).map(String.init))).sorted()
+        guard !terms.isEmpty else { return [] }
+        let query = Set(terms.flatMap { AITopicIndex.grams($0, query: true).components(separatedBy: " AND ") })
+            .sorted().joined(separator: " AND ")
+        guard !query.isEmpty else { return [] }
+
+        let statement = try statement("""
+            SELECT c.id, f.path, c.ordinal, c.label, c.folded
+            FROM chunk_fts JOIN chunks c ON c.id = chunk_fts.rowid JOIN files f ON f.id = c.file
+            WHERE chunk_fts MATCH ? ORDER BY rank
+            """)
+        defer { sqlite3_reset(statement.handle) }
+        statement.bind([query])
+        var best: [String: ContentHit] = [:]
+        while try statement.next() {
+            if isCancelled() { return [] }
+            guard let folded = try Compression.unpack(blob(statement, 4)) else { continue }
+            let bytes = [UInt8](folded)
+            guard let ranges = Self.ranges(of: needle, in: bytes), !ranges.isEmpty else { continue }
+            let path = statement.text(1)
+            let snippet = Self.snippet(bytes: bytes, ranges: ranges)
+            let hit = ContentHit(path: path, label: statement.text(3), snippet: snippet.text, highlights: snippet.highlights)
+            if let existing = best[path], existing.highlights.count >= ranges.count { continue }
+            best[path] = hit
+            if best.count >= limit { break }
+        }
+        return best.values.sorted { $0.path < $1.path }
+    }
+
+    /// Byte-level search over the folded body, returning UTF-16 ranges for AppKit.
+    private static func ranges(of needle: [UInt8], in haystack: [UInt8]) -> [NSRange]? {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
+        var utf16 = [Int](repeating: 0, count: haystack.count + 1)
+        var units = 0
+        for (i, byte) in haystack.enumerated() {
+            utf16[i] = units
+            // Continuation bytes do not advance the UTF-16 offset within a scalar's first two bytes.
+            if byte & 0xC0 != 0x80 || byte < 0x80 { units += 1 }
+        }
+        utf16[haystack.count] = units
+        var result: [NSRange] = []
+        var i = 0
+        while i + needle.count <= haystack.count {
+            if haystack[i] == needle[0], haystack[i..<i + needle.count].elementsEqual(needle) {
+                result.append(NSRange(location: utf16[i], length: utf16[i + needle.count] - utf16[i]))
+                i += needle.count
+            } else { i += 1 }
+        }
+        return result
+    }
+
+    private static func snippet(bytes: [UInt8], ranges: [NSRange], window: Int = 40) -> (text: String, highlights: [NSRange]) {
+        let first = ranges[0]
+        let start = max(0, first.location - window), end = min(bytes.count, first.location + first.length + window)
+        let slice = Array(bytes[start..<end])
+        let text = String(decoding: slice, as: UTF8.self)
+        let highlights = ranges.compactMap { range -> NSRange? in
+            let lower = max(range.location, start), upper = min(range.location + range.length, end)
+            return upper > lower ? NSRange(location: lower - start, length: upper - lower) : nil
+        }
+        return (text, highlights)
+    }
+
+    private func blob(_ statement: AITopicStatement, _ column: Int32) -> Data {
+        guard let pointer = sqlite3_column_blob(statement.handle, column) else { return Data() }
+        return Data(bytes: pointer, count: Int(sqlite3_column_bytes(statement.handle, column)))
+    }
+}
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ContentIndexSearchTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/ContentIndex.swift Tests/OilFindUITests/ContentIndexSearchTests.swift
+git commit -m "feat(content): search chunks with byte-level verification"
+```
+
+---
+
+## Task 5: 增量同步
+
+**Files:**
+- Modify: `Sources/OilFindApp/ContentSearch/ContentIndex.swift`
+- Test: `Tests/OilFindUITests/ContentIndexSyncTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+@testable import OilFindApp
+
+final class ContentIndexSyncTests: XCTestCase {
+    private var url: URL!
+    private var index: ContentIndex!
+    override func setUpWithError() throws {
+        url = FileManager.default.temporaryDirectory.appendingPathComponent("content-" + UUID().uuidString + ".sqlite")
+        index = try ContentIndex(url: url)
+    }
+    override func tearDownWithError() throws { index = nil; try? FileManager.default.removeItem(at: url) }
+
+    func testDetectsNewChangedAndRemovedFiles() throws {
+        try index.replaceChunks(file: try index.upsert(file: .init(path: "/a/1.txt", size: 1, mtime: 1, kind: 3, parser: "text")),
+                                chunks: [.init(ordinal: 0, label: "", text: "发票")])
+        try index.replaceChunks(file: try index.upsert(file: .init(path: "/a/2.txt", size: 1, mtime: 1, kind: 3, parser: "text")),
+                                chunks: [.init(ordinal: 0, label: "", text: "发票")])
+        // 1.txt unchanged, 2.txt edited, 3.txt new, 1.txt's neighbour gone.
+        let plan = try index.plan(candidates: [
+            .init(path: "/a/1.txt", size: 1, mtime: 1, kind: 3, parser: "text"),
+            .init(path: "/a/2.txt", size: 9, mtime: 9, kind: 3, parser: "text"),
+            .init(path: "/a/3.txt", size: 1, mtime: 1, kind: 3, parser: "text")])
+        XCTAssertEqual(plan.unchanged.map(\.path), ["/a/1.txt"])
+        XCTAssertEqual(plan.changed.map(\.path), ["/a/2.txt"])
+        XCTAssertEqual(plan.added.map(\.path), ["/a/3.txt"])
+        XCTAssertEqual(plan.removed, [])
+    }
+
+    func testIncompleteEnumerationNeverDeletes() throws {
+        try index.replaceChunks(file: try index.upsert(file: .init(path: "/a/1.txt", size: 1, mtime: 1, kind: 3, parser: "text")),
+                                chunks: [.init(ordinal: 0, label: "", text: "发票")])
+        let plan = try index.plan(candidates: [], complete: false)
+        XCTAssertEqual(plan.removed, [])
+        XCTAssertEqual(try index.count(), 1)
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ContentIndexSyncTests`
+Expected: 编译失败，`has no member 'plan'`
+
+**Step 3: 实现**
+
+追加到 `ContentIndex.swift`：
+
+```swift
+extension ContentIndex {
+    struct SyncPlan {
+        var added: [ContentFileRecord] = []
+        var changed: [ContentFileRecord] = []
+        var unchanged: [ContentFileRecord] = []
+        var removed: [String] = []
+    }
+
+    /// Diffs the file-system snapshot against the index. `complete` is false when the candidate
+    /// enumeration could not finish, in which case nothing is deleted.
+    func plan(candidates: [ContentFileRecord], complete: Bool = true) throws -> SyncPlan {
+        var plan = SyncPlan()
+        var seen = Set<String>()
+        for candidate in candidates {
+            seen.insert(candidate.path)
+            guard let existing = try file(path: candidate.path) else { plan.added.append(candidate); continue }
+            if existing.record.size == candidate.size, existing.record.mtime == candidate.mtime,
+               existing.record.parser == candidate.parser { plan.unchanged.append(candidate) }
+            else { plan.changed.append(candidate) }
+        }
+        guard complete else { return plan }
+        let statement = try statement("SELECT path FROM files")
+        defer { sqlite3_reset(statement.handle) }
+        while try statement.next() where !seen.contains(statement.text(0)) { plan.removed.append(statement.text(0)) }
+        return plan
+    }
+
+    func apply(_ plan: SyncPlan, parse: (ContentFileRecord) throws -> [ContentChunk]) throws {
+        for path in plan.removed { try removeFile(path: path) }
+        for record in plan.added + plan.changed {
+            let id = try upsert(file: record)
+            try replaceChunks(file: id, chunks: try parse(record))
+        }
+    }
+}
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ContentIndexSyncTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/ContentIndex.swift Tests/OilFindUITests/ContentIndexSyncTests.swift
+git commit -m "feat(content): diff file system snapshot against the index"
+```
+
+---
+
+## Task 6: 图片 OCR 解析器
+
+**Files:**
+- Create: `Sources/OilFindApp/ContentSearch/Parsers/ImageOCRParser.swift`
+- Test: `Tests/OilFindUITests/ImageOCRParserTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import AppKit
+import XCTest
+@testable import OilFindApp
+
+final class ImageOCRParserTests: XCTestCase {
+    private func screenshot(_ text: String, size: NSSize = NSSize(width: 900, height: 260)) throws -> URL {
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.white.setFill(); NSRect(origin: .zero, size: size).fill()
+        (text as NSString).draw(at: NSPoint(x: 40, y: 110),
+                                withAttributes: [.font: NSFont.systemFont(ofSize: 64), .foregroundColor: NSColor.black])
+        image.unlockFocus()
+        let rep = try XCTUnwrap(NSBitmapImageRep(data: image.tiffRepresentation!))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ocr-" + UUID().uuidString + ".png")
+        try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: url)
+        return url
+    }
+
+    func testRecognizesChineseTextInAScreenshot() throws {
+        guard ProcessInfo.processInfo.environment["CI"] != "true" else { throw XCTSkip("OCR needs a real Vision runtime") }
+        let url = try screenshot("开具发票")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let chunks = try ImageOCRParser().parse(url: url, budget: AITopicWorkBudget(), isCancelled: { false })
+        XCTAssertEqual(chunks.count, 1)
+        XCTAssertEqual(chunks[0].ordinal, 0)
+        XCTAssertTrue(chunks[0].text.contains("发票"), "recognized: \(chunks[0].text)")
+    }
+
+    func testImageWithoutTextProducesNoChunks() throws {
+        guard ProcessInfo.processInfo.environment["CI"] != "true" else { throw XCTSkip("OCR needs a real Vision runtime") }
+        let url = try screenshot("")
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertTrue(try ImageOCRParser().parse(url: url, budget: AITopicWorkBudget(), isCancelled: { false }).isEmpty)
+    }
+
+    func testCancellationStopsBeforeRunningVision() throws {
+        let url = try screenshot("开具发票")
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertTrue(try ImageOCRParser().parse(url: url, budget: AITopicWorkBudget(), isCancelled: { true }).isEmpty)
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ImageOCRParserTests`
+Expected: 编译失败，`cannot find 'ImageOCRParser' in scope`
+
+**Step 3: 实现**
+
+新建 `Sources/OilFindApp/ContentSearch/Parsers/ContentParser.swift`：
+
+```swift
+import Foundation
+
+/// A format-specific text extractor. `ordinal` and `label` locate a chunk inside the document.
+protocol ContentParser {
+    /// Stable identifier stored in `files.parser`; changing it invalidates indexed rows.
+    var identifier: String { get }
+    func parse(url: URL, budget: AITopicWorkBudget, isCancelled: () -> Bool) throws -> [ContentChunk]
+}
+
+enum ContentParserError: Error { case unsupported, tooLarge, damaged }
+```
+
+新建 `Sources/OilFindApp/ContentSearch/Parsers/ImageOCRParser.swift`：
+
+```swift
+import Foundation
+import Vision
+
+/// Vision text recognition. Revision is part of the identifier so a revision change reindexes.
+struct ImageOCRParser: ContentParser {
+    static let revision = VNRecognizeTextRequestRevision3
+    var identifier: String { "ocr-\(Self.revision)" }
+
+    /// Long edges above this are downsampled first: recognition cost grows with pixel count and
+    /// `perform` cannot yield, so a smaller image keeps single-file latency bounded.
+    static let maximumDimension: CGFloat = 3000
+
+    func parse(url: URL, budget: AITopicWorkBudget, isCancelled: () -> Bool) throws -> [ContentChunk] {
+        guard !isCancelled() else { return [] }
+        let request = VNRecognizeTextRequest()
+        request.revision = Self.revision
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        request.usesLanguageCorrection = true
+        let handler = VNImageRequestHandler(url: url, options: [:])
+        do { try handler.perform([request]) }
+        catch { throw ContentParserError.damaged }
+        guard !isCancelled(), let observations = request.results, !observations.isEmpty else { return [] }
+        // Vision returns observations in no guaranteed order; sort top-to-bottom then left-to-right.
+        let lines = observations
+            .sorted { a, b in
+                let ay = a.boundingBox.midY, by = b.boundingBox.midY
+                return abs(ay - by) > 0.01 ? ay > by : a.boundingBox.minX < b.boundingBox.minX
+            }
+            .compactMap { $0.topCandidates(1).first?.string }
+        let text = lines.joined(separator: "\n")
+        guard !text.isEmpty else { return [] }
+        return [ContentChunk(ordinal: 0, label: "", text: text)]
+    }
+}
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ImageOCRParserTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/Parsers/ Tests/OilFindUITests/ImageOCRParserTests.swift
+git commit -m "feat(content): extract text from images with Vision"
+```
+
+---
+
+## Task 7: 纯文本 / Markdown 解析器
+
+**Files:**
+- Create: `Sources/OilFindApp/ContentSearch/Parsers/TextParser.swift`
+- Test: `Tests/OilFindUITests/TextParserTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+@testable import OilFindApp
+
+final class TextParserTests: XCTestCase {
+    private var dir: URL!
+    override func setUpWithError() throws {
+        dir = FileManager.default.temporaryDirectory.appendingPathComponent("text-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+    override func tearDownWithError() throws { try? FileManager.default.removeItem(at: dir) }
+
+    private func write(_ name: String, _ data: Data) throws -> URL {
+        let url = dir.appendingPathComponent(name); try data.write(to: url); return url
+    }
+
+    func testReadsUTF8AndReportsLineLabels() throws {
+        let body = (1...200).map { "第 \($0) 行" }.joined(separator: "\n")
+        let chunks = try TextParser().parse(url: try write("a.txt", Data(body.utf8)), budget: AITopicWorkBudget(), isCancelled: { false })
+        XCTAssertEqual(chunks.count, 1)
+        XCTAssertEqual(chunks[0].ordinal, 0)
+        XCTAssertTrue(chunks[0].text.contains("第 200 行"))
+        XCTAssertTrue(chunks[0].label.hasPrefix("第 1 行"))
+    }
+
+    func testSplitsLongFilesIntoMultipleChunks() throws {
+        let body = (1...20000).map { "第 \($0) 行，这里是一些足够长的中文内容用来撑大文件体积。" }.joined(separator: "\n")
+        let chunks = try TextParser().parse(url: try write("big.log", Data(body.utf8)), budget: AITopicWorkBudget(), isCancelled: { false })
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertEqual(chunks.map(\.ordinal), Array(0..<chunks.count))
+    }
+
+    func testDetectsUTF16() throws {
+        let body = "开具发票的日期"
+        let data = try XCTUnwrap(body.data(using: .utf16))
+        let chunks = try TextParser().parse(url: try write("u16.txt", data), budget: AITopicWorkBudget(), isCancelled: { false })
+        XCTAssertTrue(chunks[0].text.contains("开具发票"))
+    }
+
+    func testFallsBackToGB18030ForLegacyChineseFiles() throws {
+        let body = "开具发票的日期是三月五日"
+        let encoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+        let data = try XCTUnwrap(body.data(using: encoding))
+        let chunks = try TextParser().parse(url: try write("gbk.txt", data), budget: AITopicWorkBudget(), isCancelled: { false })
+        XCTAssertTrue(chunks[0].text.contains("开具发票"), "decoded: \(chunks[0].text)")
+    }
+
+    func testRejectsOversizedFiles() throws {
+        let url = try write("huge.txt", Data(repeating: 0x41, count: 1024))
+        XCTAssertThrowsError(try TextParser(maximumBytes: 512).parse(url: url, budget: AITopicWorkBudget(), isCancelled: { false }))
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter TextParserTests`
+Expected: 编译失败，`cannot find 'TextParser' in scope`
+
+**Step 3: 实现**
+
+新建 `Sources/OilFindApp/ContentSearch/Parsers/TextParser.swift`：
+
+```swift
+import Foundation
+
+/// Plain text, Markdown, CSV/TSV and logs. Splits on line boundaries into ~64 KiB chunks.
+struct TextParser: ContentParser {
+    var maximumBytes = 32 * 1024 * 1024
+    var chunkBytes = 64 * 1024
+    var identifier: String { "text-1" }
+
+    func parse(url: URL, budget: AITopicWorkBudget, isCancelled: () -> Bool) throws -> [ContentChunk] {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        guard (size ?? 0) <= maximumBytes else { throw ContentParserError.tooLarge }
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let text = try Self.decode(data)
+        guard !text.isEmpty else { return [] }
+
+        var chunks: [ContentChunk] = []
+        var buffer = "", firstLine = 1, line = 1
+        for piece in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if buffer.utf8.count + piece.utf8.count + 1 > chunkBytes, !buffer.isEmpty {
+                chunks.append(ContentChunk(ordinal: chunks.count, label: "第 \(firstLine) 行附近", text: buffer))
+                buffer = ""; firstLine = line
+            }
+            if !buffer.isEmpty { buffer += "\n" }
+            buffer += piece
+            line += 1
+            try budget.checkpoint(isCancelled: isCancelled)
+            if isCancelled() { return [] }
+        }
+        if !buffer.isEmpty { chunks.append(ContentChunk(ordinal: chunks.count, label: "第 \(firstLine) 行附近", text: buffer)) }
+        return chunks
+    }
+
+    /// UTF-8 first, then UTF-16 when the BOM or a NUL pattern says so, then GB18030 for the
+    /// legacy Chinese files that are still common in exports and downloads.
+    static func decode(_ data: Data) throws -> String {
+        if let text = String(data: data, encoding: .utf8) { return text }
+        if let text = String(data: data, encoding: .utf16) { return text }
+        let gb18030 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+            CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+        if let text = String(data: data, encoding: gb18030) { return text }
+        throw ContentParserError.damaged
+    }
+}
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter TextParserTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/Parsers/TextParser.swift Tests/OilFindUITests/TextParserTests.swift
+git commit -m "feat(content): parse plain text with encoding fallback"
+```
+
+---
+
+## Task 8: 索引器（候选枚举 + 预算 + 取消）
+
+**Files:**
+- Create: `Sources/OilFindApp/ContentSearch/ContentIndexer.swift`
+- Test: `Tests/OilFindUITests/ContentIndexerTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+import OilFindCore
+@testable import OilFindApp
+
+final class ContentIndexerTests: XCTestCase {
+    private var dir: URL!, db: URL!, index: ContentIndex!
+    override func setUpWithError() throws {
+        dir = FileManager.default.temporaryDirectory.appendingPathComponent("idx-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        db = dir.appendingPathComponent("index.sqlite")
+        index = try ContentIndex(url: db)
+    }
+    override func tearDownWithError() throws { index = nil; try? FileManager.default.removeItem(at: dir) }
+
+    /// Index 0 must be the root directory: `IndexStore.resolve(path:)` walks down from it.
+    /// `sizes` and `mtimes` are `[UInt32]` on `ScanBuffer`, not `UInt64`/`Int64`.
+    private func store(root: String, names: [String], kinds: [UInt8]) -> IndexStore {
+        var buffer = ScanBuffer()
+        let count = names.count
+        buffer.ids = (0..<UInt32(count)).map { $0 }
+        buffer.parents = [UInt32](repeating: 0, count: count)
+        buffer.sizes = [UInt32](repeating: 1, count: count)
+        buffer.mtimes = [UInt32](repeating: 1, count: count)
+        buffer.flags = [SiftFlag.dir] + [UInt8](repeating: SiftFlag.userArea, count: count - 1)
+        buffer.depths = [0] + [UInt8](repeating: 1, count: count - 1)
+        buffer.kinds = kinds
+        buffer.nameLens = names.map { UInt32($0.utf8.count) }
+        buffer.nameBytes = Array(names.joined().utf8)
+        return IndexStore(scan: ScanOutput(buffers: [buffer], count: count, homeIndex: .max, elapsed: 0, finishedAt: 0),
+                          config: IndexConfig(rootPath: root))
+    }
+
+    func testIndexesOnlyDocumentAndImageEntries() throws {
+        let text = dir.appendingPathComponent("note.txt"); try Data("开具发票的日期".utf8).write(to: text)
+        let store = store(root: dir.path, names: ["", "note.txt", "app.bin"], kinds: [1, 3, 0])
+        let indexer = ContentIndexer(index: index, parsers: [TextParser()])
+        try indexer.synchronize(store: store, isCancelled: { false })
+        XCTAssertEqual(try index.count(), 1)
+        XCTAssertEqual(try index.search("发票", limit: 10, isCancelled: { false }).first?.path, text.path)
+    }
+
+    func testSecondRunIsANoOp() throws {
+        let text = dir.appendingPathComponent("note.txt"); try Data("开具发票的日期".utf8).write(to: text)
+        let store = store(root: dir.path, names: ["", "note.txt"], kinds: [1, 3])
+        let indexer = ContentIndexer(index: index, parsers: [TextParser()])
+        try indexer.synchronize(store: store, isCancelled: { false })
+        let first = try index.file(path: text.path)
+        try indexer.synchronize(store: store, isCancelled: { false })
+        XCTAssertEqual(try index.file(path: text.path)?.revision, first?.revision)
+    }
+
+    func testRemovedFileIsDroppedFromTheIndex() throws {
+        let text = dir.appendingPathComponent("note.txt"); try Data("开具发票".utf8).write(to: text)
+        let indexer = ContentIndexer(index: index, parsers: [TextParser()])
+        try indexer.synchronize(store: store(root: dir.path, names: ["", "note.txt"], kinds: [1, 3]), isCancelled: { false })
+        try FileManager.default.removeItem(at: text)
+        try indexer.synchronize(store: store(root: dir.path, names: [""], kinds: [1]), isCancelled: { false })
+        XCTAssertEqual(try index.count(), 0)
+    }
+
+    func testDamagedFileIsSkippedAndCounted() throws {
+        let bad = dir.appendingPathComponent("bad.txt")
+        try Data([0xFF, 0xFE, 0x00, 0x01, 0xFF]).write(to: bad)
+        let indexer = ContentIndexer(index: index, parsers: [TextParser()])
+        try indexer.synchronize(store: store(root: dir.path, names: ["", "bad.txt"], kinds: [1, 3]), isCancelled: { false })
+        XCTAssertEqual(indexer.failedCount, 1)
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ContentIndexerTests`
+Expected: 编译失败，`cannot find 'ContentIndexer' in scope`
+
+**Step 3: 实现**
+
+新建 `Sources/OilFindApp/ContentSearch/ContentIndexer.swift`：
+
+```swift
+import Foundation
+import OilFindCore
+
+/// Walks the file index for document and image entries and keeps the content index in sync.
+/// Candidates come from `IndexStore` rather than the file system, so the existing index scope
+/// and exclusions apply automatically.
+final class ContentIndexer {
+    private let index: ContentIndex
+    private let parsers: [ContentParser]
+    private let budget: AITopicWorkBudget
+    private(set) var failedCount = 0
+
+    /// The store's read lock blocks index writes, so candidates are copied out in batches.
+    static let batchSize = 20_000
+
+    init(index: ContentIndex, parsers: [ContentParser], budget: AITopicWorkBudget = AITopicWorkBudget(fraction: 0.10)) {
+        self.index = index; self.parsers = parsers; self.budget = budget
+    }
+
+    func synchronize(store: IndexStore, isCancelled: () -> Bool) throws {
+        failedCount = 0
+        var candidates: [ContentFileRecord] = []
+        var complete = true
+        var offset = 1
+        while offset < store.count {
+            if isCancelled() { complete = false; break }
+            let batch = store.read { () -> [ContentFileRecord] in
+                let upper = min(store.count, offset + Self.batchSize)
+                var records: [ContentFileRecord] = []
+                records.reserveCapacity(upper - offset)
+                for i in offset..<upper where store.isLive(UInt32(i)) {
+                    let kind = store.kind[i]
+                    guard kind == 3 || kind == 4, store.flags[i] & SiftFlag.dir == 0 else { continue }
+                    let path = store.path(UInt32(i))
+                    guard let parser = parser(for: path, kind: kind) else { continue }
+                    records.append(ContentFileRecord(path: path, size: Int64(store.size(UInt32(i))),
+                                                     mtime: Int64(store.mtime[i]), kind: kind, parser: parser.identifier))
+                }
+                return records
+            }
+            candidates.append(contentsOf: batch)
+            offset += Self.batchSize
+            try budget.checkpoint(isCancelled: isCancelled)
+        }
+        let plan = try index.plan(candidates: candidates, complete: complete)
+        try index.apply(plan) { record in
+            guard let parser = parsers.first(where: { $0.identifier == record.parser }) else { return [] }
+            do { return try parser.parse(url: URL(fileURLWithPath: record.path), budget: budget, isCancelled: isCancelled) }
+            catch { failedCount += 1; return [] }
+        }
+    }
+
+    private func parser(for path: String, kind: UInt8) -> ContentParser? {
+        let ext = (path as NSString).pathExtension.lowercased()
+        guard kind == 3, Self.textExtensions.contains(ext) else { return nil }
+        return parsers.first { $0 is TextParser }
+    }
+
+    static let textExtensions: Set<String> = ["txt", "md", "markdown", "csv", "tsv", "log"]
+}
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ContentIndexerTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/ContentIndexer.swift Tests/OilFindUITests/ContentIndexerTests.swift
+git commit -m "feat(content): index document and image entries from the file index"
+```
+
+---
+
+## Task 9: Provider —— 路径解析成 entryID
+
+这是整个 M1 最容易出错的一环。必须有一条测试证明**压实之后命中仍然指向同一个文件**。
+
+**Files:**
+- Create: `Sources/OilFindApp/ContentSearch/ContentSearchProvider.swift`
+- Test: `Tests/OilFindUITests/ContentSearchProviderTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+import OilFindCore
+@testable import OilFindApp
+
+final class ContentSearchProviderTests: XCTestCase {
+    private var dir: URL!, index: ContentIndex!
+    override func setUpWithError() throws {
+        dir = FileManager.default.temporaryDirectory.appendingPathComponent("prov-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        index = try ContentIndex(url: dir.appendingPathComponent("index.sqlite"))
+    }
+    override func tearDownWithError() throws { index = nil; try? FileManager.default.removeItem(at: dir) }
+
+    /// Index 0 is the root directory, so `paths` must be direct children of "/" ("/note.txt",
+    /// not "/note.txt"). `resolve(path:)` starts its walk at index 0 and needs the dir flag.
+    private func store(paths: [String]) -> IndexStore {
+        var buffer = ScanBuffer()
+        let names = [""] + paths.map { ($0 as NSString).lastPathComponent }
+        let count = names.count
+        buffer.ids = (0..<UInt32(count)).map { $0 }
+        buffer.parents = [UInt32](repeating: 0, count: count)
+        buffer.sizes = [UInt32](repeating: 1, count: count)
+        buffer.mtimes = [UInt32](repeating: 1, count: count)
+        buffer.flags = [SiftFlag.dir] + [UInt8](repeating: SiftFlag.userArea, count: count - 1)
+        buffer.depths = [0] + [UInt8](repeating: 1, count: count - 1)
+        buffer.kinds = [1] + [UInt8](repeating: 3, count: count - 1)
+        buffer.nameLens = names.map { UInt32($0.utf8.count) }
+        buffer.nameBytes = Array(names.joined().utf8)
+        return IndexStore(scan: ScanOutput(buffers: [buffer], count: count, homeIndex: .max, elapsed: 0, finishedAt: 0),
+                          config: IndexConfig(rootPath: "/"))
+    }
+
+    func testResolvesPathToTheCurrentEntryID() throws {
+        let store = store(paths: ["/note.txt"])
+        store.buildHash()
+        let id = try index.upsert(file: .init(path: "/note.txt", size: 1, mtime: 1, kind: 3, parser: "text-1"))
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "", text: "开具发票的日期")])
+        let provider = ContentSearchProvider(index: index)
+        let source = SearchSource(id: "startup", displayName: "", isOnline: true, store: store)
+        let hits = provider.prepareSearch(Query.parse("发票"), options: SearchOptions(), sources: [source], isCancelled: { false })()
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(store.path(hits[0].entryID), "/note.txt")
+        XCTAssertEqual(hits[0].sourceVersion, store.read { store.version })
+    }
+
+    /// The regression this design exists to prevent: compaction renumbers entries, so a stored
+    /// entry ID would point at a different file. Storing paths keeps the hit on the right file.
+    func testHitStillPointsAtTheSameFileAfterCompaction() throws {
+        let store = store(paths: ["/gone.txt", "/note.txt"])
+        store.write { _ = store.remove(1) }         // "gone.txt" is now a tombstone
+        let compacted = store.read { store.compacted() }   // renumbers every live entry
+        XCTAssertEqual(compacted.path(compacted.resolve(path: "/note.txt")!), "/note.txt")
+        let id = try index.upsert(file: .init(path: "/note.txt", size: 1, mtime: 1, kind: 3, parser: "text-1"))
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "", text: "开具发票的日期")])
+        let provider = ContentSearchProvider(index: index)
+        let source = SearchSource(id: "startup", displayName: "", isOnline: true, store: compacted)
+        let hits = provider.prepareSearch(Query.parse("发票"), options: SearchOptions(), sources: [source], isCancelled: { false })()
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(compacted.path(hits[0].entryID), "/note.txt")
+    }
+
+    func testUnresolvablePathsAreDropped() throws {
+        let id = try index.upsert(file: .init(path: "/not/indexed.txt", size: 1, mtime: 1, kind: 3, parser: "text-1"))
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        let provider = ContentSearchProvider(index: index)
+        let store = store(paths: ["/note.txt"]); store.buildHash()   // without this the test would pass for the wrong reason
+        let source = SearchSource(id: "startup", displayName: "", isOnline: true, store: store)
+        XCTAssertTrue(provider.prepareSearch(Query.parse("发票"), options: SearchOptions(), sources: [source], isCancelled: { false })().isEmpty)
+    }
+
+    func testDisabledProviderReturnsNothing() throws {
+        let store = store(paths: ["/note.txt"]); store.buildHash()
+        let id = try index.upsert(file: .init(path: "/note.txt", size: 1, mtime: 1, kind: 3, parser: "text-1"))
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "", text: "开具发票")])
+        let provider = ContentSearchProvider(index: index); provider.isEnabled = false
+        let source = SearchSource(id: "startup", displayName: "", isOnline: true, store: store)
+        XCTAssertTrue(provider.prepareSearch(Query.parse("发票"), options: SearchOptions(), sources: [source], isCancelled: { false })().isEmpty)
+    }
+
+    func testDetailTextAndHighlightRangesStayInsideTheDetailString() throws {
+        let store = store(paths: ["/note.txt"]); store.buildHash()
+        let id = try index.upsert(file: .init(path: "/note.txt", size: 1, mtime: 1, kind: 3, parser: "text-1"))
+        try index.replaceChunks(file: id, chunks: [.init(ordinal: 0, label: "", text: "本月开具发票的日期是三月五日")])
+        let provider = ContentSearchProvider(index: index)
+        let source = SearchSource(id: "startup", displayName: "", isOnline: true, store: store)
+        let hit = try XCTUnwrap(provider.prepareSearch(Query.parse("发票"), options: SearchOptions(), sources: [source], isCancelled: { false })().first)
+        let presentation = hit.presentation
+        XCTAssertTrue(presentation.text.contains("发票"))
+        for range in presentation.highlights {
+            XCTAssertLessThanOrEqual(NSMaxRange(range), (presentation.text as NSString).length)
+            XCTAssertEqual((presentation.text as NSString).substring(with: range), "发票")
+        }
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ContentSearchProviderTests`
+Expected: 编译失败，`cannot find 'ContentSearchProvider' in scope`
+
+**Step 3: 实现**
+
+新建 `Sources/OilFindApp/ContentSearch/ContentSearchProvider.swift`：
+
+```swift
+import AppKit
+import OilFindCore
+
+/// Publishes content matches as supplementary hits on file rows.
+final class ContentSearchProvider: SupplementarySearchProvider {
+    private let index: ContentIndex
+    private let queue = DispatchQueue(label: "com.oiloil.find.content.search", qos: .userInitiated)
+    var isEnabled = true
+
+    init(index: ContentIndex) { self.index = index }
+
+    func prepareSearch(_ query: Query, options: SearchOptions, sources: [SearchSource],
+                       isCancelled: @escaping () -> Bool) -> () -> [SupplementaryHit] {
+        guard isEnabled, !sources.isEmpty else { return { [] } }
+        let text = query.raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count >= 1 else { return { [] } }
+        let captured = sources
+        return { [index] in
+            guard let found = try? index.search(text, limit: 200, isCancelled: isCancelled), !found.isEmpty else { return [] }
+            if isCancelled() { return [] }
+            var hits: [SupplementaryHit] = []
+            for source in captured {
+                // Resolve under one read lock so the stamped version matches the resolution.
+                let resolved = source.store.read { () -> (version: UInt64, rows: [(ContentHit, UInt32)]) in
+                    guard source.store.hashReady else { return (source.store.version, []) }
+                    let rows = found.compactMap { hit -> (ContentHit, UInt32)? in
+                        guard let id = source.store.resolve(path: hit.path), source.store.isLive(id) else { return nil }
+                        return (hit, id)
+                    }
+                    return (source.store.version, rows)
+                }
+                for (hit, id) in resolved.rows {
+                    hits.append(Self.makeHit(hit: hit, source: source, entryID: id, version: resolved.version))
+                }
+            }
+            return hits
+        }
+    }
+
+    private static func makeHit(hit: ContentHit, source: SearchSource, entryID: UInt32, version: UInt64) -> SupplementaryHit {
+        let prefix = hit.label.isEmpty ? "" : hit.label + "："
+        let detail = prefix + hit.snippet
+        let offset = (prefix as NSString).length
+        let ranges = hit.highlights.map { NSRange(location: $0.location + offset, length: $0.length) }
+        let isImage = (hit.path as NSString).pathExtension.lowercased() != "txt"
+        return SupplementaryHit(sourceID: source.id, entryID: entryID, detail: detail,
+                                highlights: ranges, thumbnail: isImage, sourceVersion: version)
+    }
+
+    func sourcesDidChange(_ sources: [SearchSource]) { }
+    func userActivity(visible: Bool, typing: Bool) { }
+}
+```
+
+实现时把 `isImage` 换成按 `files.kind` 判断（`ContentHit` 里带上 `kind`），别用扩展名猜。
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ContentSearchProviderTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/ContentSearchProvider.swift Tests/OilFindUITests/ContentSearchProviderTests.swift
+git commit -m "feat(content): resolve hits to live entry ids and stamp store version"
+```
+
+---
+
+## Task 10: supplementary 多路复用器
+
+`supplementaryProvider` 是单槽位（`SearchViewController.swift:48`），当前被 Pro 扩展占用。加一层合并，不抢槽位。
+
+**Files:**
+- Create: `Sources/OilFindApp/ContentSearch/SupplementaryMultiplexer.swift`
+- Test: `Tests/OilFindUITests/SupplementaryMultiplexerTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+import OilFindCore
+@testable import OilFindApp
+
+final class SupplementaryMultiplexerTests: XCTestCase {
+    private final class Provider: SupplementarySearchProvider {
+        var isEnabled = true
+        var lastVisible: Bool?
+        var lastBusy: Bool?
+        var sourceCount = 0
+        let label: String
+        init(label: String) { self.label = label }
+        func prepareSearch(_ query: Query, options: SearchOptions, sources: [SearchSource], isCancelled: @escaping () -> Bool) -> () -> [SupplementaryHit] {
+            let enabled = isEnabled, label = label
+            return { enabled ? [.init(sourceID: "startup", entryID: 1, detail: label)] : [] }
+        }
+        func sourcesDidChange(_ sources: [SearchSource]) { sourceCount = sources.count }
+        func userActivity(visible: Bool, typing: Bool) { lastVisible = visible }
+        func backgroundIndexingChanged(_ busy: Bool) { lastBusy = busy }
+    }
+
+    func testMergesHitsFromEveryEnabledProvider() throws {
+        let a = Provider(label: "A"), b = Provider(label: "B")
+        let multiplexer = SupplementaryMultiplexer(providers: [a, b])
+        let hits = multiplexer.prepareSearch(Query.parse("x"), options: SearchOptions(), sources: [], isCancelled: { false })()
+        XCTAssertEqual(hits.map(\.detail).sorted(), ["A", "B"])
+    }
+
+    func testDisabledProviderContributesNothing() throws {
+        let a = Provider(label: "A"), b = Provider(label: "B")
+        b.isEnabled = false
+        let multiplexer = SupplementaryMultiplexer(providers: [a, b])
+        XCTAssertEqual(multiplexer.prepareSearch(Query.parse("x"), options: SearchOptions(), sources: [], isCancelled: { false })().map(\.detail), ["A"])
+    }
+
+    func testReportsDisabledOnlyWhenEveryProviderIsDisabled() throws {
+        let a = Provider(label: "A"), b = Provider(label: "B")
+        let multiplexer = SupplementaryMultiplexer(providers: [a, b])
+        XCTAssertTrue(multiplexer.isEnabled)
+        b.isEnabled = false
+        XCTAssertTrue(multiplexer.isEnabled)
+        a.isEnabled = false
+        XCTAssertFalse(multiplexer.isEnabled)
+    }
+
+    func testLifecycleCallbacksReachEveryProvider() throws {
+        let a = Provider(label: "A"), b = Provider(label: "B")
+        let multiplexer = SupplementaryMultiplexer(providers: [a, b])
+        multiplexer.userActivity(visible: true, typing: false)
+        multiplexer.backgroundIndexingChanged(true)
+        XCTAssertEqual(a.lastVisible, true); XCTAssertEqual(b.lastVisible, true)
+        XCTAssertEqual(a.lastBusy, true); XCTAssertEqual(b.lastBusy, true)
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter SupplementaryMultiplexerTests`
+Expected: 编译失败
+
+**Step 3: 实现**
+
+新建 `Sources/OilFindApp/ContentSearch/SupplementaryMultiplexer.swift`：
+
+```swift
+import OilFindCore
+
+/// Fans one supplementary slot out to several providers. `supplementaryProvider` on
+/// `SearchViewController` is a single slot, and the Pro extension already needs it.
+final class SupplementaryMultiplexer: SupplementarySearchProvider {
+    private let providers: [SupplementarySearchProvider]
+    init(providers: [SupplementarySearchProvider]) { self.providers = providers }
+    var isEnabled: Bool { providers.contains { $0.isEnabled } }
+
+    func prepareSearch(_ query: Query, options: SearchOptions, sources: [SearchSource],
+                       isCancelled: @escaping () -> Bool) -> () -> [SupplementaryHit] {
+        let work = providers.filter(\.isEnabled).map { $0.prepareSearch(query, options: options, sources: sources, isCancelled: isCancelled) }
+        guard !work.isEmpty else { return { [] } }
+        return { work.flatMap { $0() } }
+    }
+    func sourcesDidChange(_ sources: [SearchSource]) { providers.forEach { $0.sourcesDidChange(sources) } }
+    func userActivity(visible: Bool, typing: Bool) { providers.forEach { $0.userActivity(visible: visible, typing: typing) } }
+    func backgroundIndexingChanged(_ busy: Bool) { providers.forEach { $0.backgroundIndexingChanged(busy) } }
+}
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter SupplementaryMultiplexerTests`
+Expected: PASS
+
+**Step 5: 提交**
+
+```sh
+git add Sources/OilFindApp/ContentSearch/SupplementaryMultiplexer.swift Tests/OilFindUITests/SupplementaryMultiplexerTests.swift
+git commit -m "feat(content): multiplex the single supplementary provider slot"
+```
+
+---
+
+## Task 11: Manager、设置分区与接线
+
+**Files:**
+- Create: `Sources/OilFindApp/ContentSearch/ContentManager.swift`
+- Create: `Sources/OilFindApp/ContentSearch/ContentSettings.swift`
+- Modify: `Sources/OilFindApp/AppDelegate.swift:59-71`
+- Modify: `Sources/OilFindApp/SettingsWindow.swift:368-369`
+- Modify: `Sources/OilFindApp/L10n.swift`
+- Test: `Tests/OilFindUITests/ContentSettingsTests.swift`
+
+**Step 1: 写失败测试**
+
+```swift
+import XCTest
+@testable import OilFindApp
+
+final class ContentSettingsTests: XCTestCase {
+    func testManagerDefaultsToDisabledAndPersistsToggle() throws {
+        let defaults = UserDefaults(suiteName: "content-" + UUID().uuidString)!
+        let manager = ContentManager(defaults: defaults, indexURL: nil)
+        XCTAssertFalse(manager.enabled)
+        manager.setEnabled(true)
+        XCTAssertTrue(ContentManager(defaults: defaults, indexURL: nil).enabled)
+    }
+    func testDisablingProviderImmediatelyStopsHits() throws {
+        let defaults = UserDefaults(suiteName: "content-" + UUID().uuidString)!
+        let manager = ContentManager(defaults: defaults, indexURL: nil)
+        manager.setEnabled(true)
+        XCTAssertTrue(manager.provider.isEnabled)
+        manager.setEnabled(false)
+        XCTAssertFalse(manager.provider.isEnabled)
+    }
+    func testLocalizedCopyExistsInBothLanguages() throws {
+        for key in ["contentTitle", "contentEnabled", "contentPrivacy", "contentBuilding", "contentDone"] {
+            XCTAssertNotEqual(L10n.text(key, chinese: true), key)
+            XCTAssertNotEqual(L10n.text(key, chinese: false), key)
+        }
+    }
+}
+```
+
+**Step 2: 跑测试确认失败**
+
+Run: `swift test --filter ContentSettingsTests`
+Expected: 编译失败
+
+**Step 3: 实现**
+
+`ContentManager`：持有一个写连接、一个只读连接、`ContentIndexer`、`ContentSearchProvider`，用 `@Published` 暴露 `enabled` / `indexing` / `count` / `diskBytes` / `failed`，照 `AITopicManager` 的骨架写。`start()` / `stop()` / `languageDidChange` 与 `AITopicManager` 同名同义。
+
+`L10n.swift` 按现有格式加键（中英对照）：
+
+```swift
+"contentTitle": ("文件内容", "File contents"),
+"contentEnabled": ("搜索图片和文档里的文字", "Search text inside images and documents"),
+"contentPrivacy": ("图片和文档都在本机处理，不会上传。", "Images and documents are processed on this Mac and never uploaded."),
+"contentBuilding": ("正在建立内容索引…", "Building content index…"),
+"contentDone": ("已索引 %@ 个文件", "Indexed %@ files"),
+"contentRebuild": ("重建索引", "Rebuild index"),
+"contentClear": ("清除索引", "Clear index"),
+```
+
+`AppDelegate.swift:59` 改接线：
+
+```swift
+panel.searchController.supplementaryProvider = SupplementaryMultiplexer(
+    providers: [contentSearch.provider] + [appExtension?.supplementarySearchProvider].compactMap { $0 })
+```
+
+`SettingsWindow.swift:368-369` 之后插入：
+
+```swift
+Section(L10n.text("contentTitle")) { ContentSettings(manager: model.contentSearch) }
+```
+
+**Step 4: 跑测试确认通过**
+
+Run: `swift test --filter ContentSettingsTests`
+Expected: PASS
+
+**Step 5: 全量验证**
+
+```sh
+swift build
+swift test
+OILFIND_FREE=1 swift build
+OILFIND_FREE=1 swift test
+python3 Tests/Scripts/test_open_core.py
+```
+
+Expected: 全部通过。注意 `OILFIND_FREE=1` 下内容搜索仍在（它是免费功能），只有 Pro 扩展被排除。
+
+**Step 6: 界面快照验证**
+
+```sh
+scripts/build-app.sh --debug
+"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/content-settings.png --state settings --settings-scroll content
+"build/debug/Oil Find.app/Contents/MacOS/OilFind" --snapshot /tmp/content-hit.png --query 发票
+```
+
+Expected: 第一张能看到内容分区；第二张能看到命中行带 detail 和高亮。
+
+**Step 7: 提交**
+
+```sh
+git add -A
+git commit -m "feat(content): add content search manager, settings and wiring"
+```
+
+---
+
+## M1 完成标准
+
+- [ ] `swift test` 与 `OILFIND_FREE=1 swift test` 全绿
+- [ ] `python3 Tests/Scripts/test_open_core.py` 通过
+- [ ] 截图里的中文能被搜到，命中行有 detail 和高亮
+- [ ] 纯文本/Markdown 文件内容能被搜到
+- [ ] 压实之后命中仍指向正确的文件（Task 9 的回归测试）
+- [ ] 关掉开关立刻撤下命中
+- [ ] 设置分区中英文都有文案，切换语言即时刷新
+
+## 明确不在 M1 范围
+
+PDF、docx、xlsx、pptx、RTF、图片画面识别、外置盘路径 rebase、`chunk_fts` 的 `optimize`/`VACUUM` 一次性门闩、内容索引的体积门限测试（M2 做）。
