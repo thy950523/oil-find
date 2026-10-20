@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 import plistlib
 import subprocess
@@ -24,6 +25,14 @@ def check_launch(package):
         subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
         with (app / "Contents/Info.plist").open("rb") as source:
             info = plistlib.load(source)
+        # The settings pane shows this date, so a bundle without it cannot say which build it is.
+        packaged = info.get("OilFindPackagedAt")
+        if not packaged:
+            raise RuntimeError("The packaged app has no OilFindPackagedAt entry in Info.plist.")
+        try:
+            datetime.strptime(packaged, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise RuntimeError(f"OilFindPackagedAt is not a UTC timestamp: {packaged!r}")
         workspace = root / ".oilfind-update-launch-check"
         workspace.mkdir()
         (workspace / "receipt.json").write_text(json.dumps({
@@ -59,7 +68,8 @@ def check_launch(package):
                             confirmed_at = time.monotonic()
                         elif time.monotonic() - confirmed_at >= 2:
                             print(f"Packaged launch passed: {info['CFBundleShortVersionString']} "
-                                  f"(build {info['CFBundleVersion']}), isolated resources and launch acknowledgement.")
+                                  f"(build {info['CFBundleVersion']}, packaged {packaged}), "
+                                  f"isolated resources and launch acknowledgement.")
                             return
                     time.sleep(0.05)
                 log.seek(0)

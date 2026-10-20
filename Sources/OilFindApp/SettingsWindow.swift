@@ -294,7 +294,13 @@ private struct UpdateSettingsRow: View {
                 Spacer()
                 Button(L10n.text("update.check")) { update.check() }.disabled(!update.canCheck)
             }
-            Text(UpdateManager.current.version.text).font(.footnote).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text(UpdateManager.current.version.text)
+                // Hidden in a development build, which has no packaging step to date.
+                if let packaged = PackagedBuild.date {
+                    Text(L10n.text("update.packaged", PackagedBuild.text(packaged)))
+                }
+            }.font(.footnote).foregroundStyle(.secondary)
         }
     }
 }

@@ -18,6 +18,10 @@ if [[ "$CONFIGURATION" == release ]]; then
     strip -S "$APP_PATH/Contents/MacOS/OilFind"
 fi
 cp "Resources/Info.plist" "$APP_PATH/Contents/Info.plist"
+# The packaging date goes into the built bundle, not the repository, so it describes the app in hand
+# and the settings pane can show it. UTC, so the value does not depend on this machine's time zone.
+# It has to be written before signing: the signature covers Info.plist.
+/usr/libexec/PlistBuddy -c "Add :OilFindPackagedAt string $(date -u +%Y-%m-%dT%H:%M:%SZ)" "$APP_PATH/Contents/Info.plist"
 if [[ -f "Resources/AppIcon.icns" ]]; then
     cp "Resources/AppIcon.icns" "$APP_PATH/Contents/Resources/AppIcon.icns"
 fi
