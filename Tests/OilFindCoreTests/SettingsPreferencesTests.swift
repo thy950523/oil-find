@@ -53,6 +53,26 @@ final class SettingsPreferencesTests: XCTestCase {
         XCTAssertTrue(defaults.bool(forKey: "legacyAuthorizationCleanupCompleted"))
     }
 
+    func testClearAllKeepsTheOnboardingState() {
+        let (defaults, name) = suite()
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(true, forKey: "didFinishOnboarding")
+        defaults.set(true, forKey: "skippedFullDiskAccess")
+        defaults.set(true, forKey: "pinyinEnabled")
+
+        SettingsPreferences.clearAll(in: defaults)
+
+        // Onboarding is one-time lifecycle state, not a preference: a user who clears their
+        // settings must not be shown the welcome screen again. Probe the suite's own store, since
+        // the registration domain is process-wide.
+        let stored = defaults.persistentDomain(forName: name) ?? [:]
+        XCTAssertEqual(stored["didFinishOnboarding"] as? Bool, true)
+        XCTAssertEqual(stored["skippedFullDiskAccess"] as? Bool, true)
+        // The same clearAll call must still wipe ordinary preferences, or the assertions above
+        // would pass even if clearAll had become a complete no-op.
+        XCTAssertNil(stored["pinyinEnabled"])
+    }
+
     func testClearAllFallsBackToTheRegisteredDefaults() {
         let (defaults, name) = suite()
         defer { defaults.removePersistentDomain(forName: name) }

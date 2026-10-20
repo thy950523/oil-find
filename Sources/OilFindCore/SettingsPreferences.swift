@@ -23,12 +23,20 @@ public enum SettingsPreferences {
     /// lives in the app layer, but the key is owned here so `clearAll` can protect it without a
     /// second literal.
     public static let legacyAuthorizationCleanupCompletedKey = "legacyAuthorizationCleanupCompleted"
-    /// Keys that `clearAll` leaves alone. The three `proEvaluation*` anchors belong to the private
-    /// `Pro/` module, which `OilFindCore` must not depend on, so they stay as literals here — a
-    /// rename there has to be caught in review rather than by the compiler.
+    /// Keys that `clearAll` leaves alone: state that is not a user preference. That means the
+    /// anti-abuse `proEvaluation*` anchors, one-time migration stamps, and one-time lifecycle
+    /// state such as whether onboarding has been completed. The three `proEvaluation*` anchors
+    /// belong to the private `Pro/` module, which `OilFindCore` must not depend on, so they stay
+    /// as literals here — a rename there has to be caught in review rather than by the compiler.
     private static let protectedKeys: Set<String> = [
         "proEvaluationStartedAt", "proEvaluationLastSeenAt", "proEvaluationEndedAt",
         legacyAuthorizationCleanupCompletedKey,
+        // Onboarding completion is one-time lifecycle state, not a preference, so clearing the
+        // settings must not replay the welcome screen. These keys only reach the application
+        // domain once they have actually been stored; if they were never stored, `removeObject`
+        // is already a no-op and the registered default (`false`) applies. The protection matters
+        // for a user who has already completed onboarding.
+        "didFinishOnboarding", "skippedFullDiskAccess",
     ]
     /// Restores every setting to its default. The protected keys survive: wiping the Pro anchors
     /// would hand out a fresh trial, and wiping the cleanup stamp would re-run a one-time
@@ -36,11 +44,12 @@ public enum SettingsPreferences {
     /// `SettingsModel`, `IndexManager` and the registered hot key, and re-reading all three in
     /// place is more ways to go wrong than restarting once.
     public static func clearAll(in defaults: UserDefaults = .standard) {
-        // dictionaryRepresentation() is a union of the application, global and registration
-        // domains; removeObject is a no-op for the global and registration entries, so iterating
-        // the merged dictionary is deliberate — the application domain name is not derivable from
-        // an arbitrary injected UserDefaults. Unlike setExcludedExtensions this posts no
-        // excludedExtensionsChanged notification, which the relaunch contract makes moot.
+        // dictionaryRepresentation() is a union of the application, argument, global and
+        // registration domains; removeObject is a no-op for the argument, global and registration
+        // entries (the argument domain carries launch arguments such as `-didFinishOnboarding YES`),
+        // so iterating the merged dictionary is deliberate — the application domain name is not
+        // derivable from an arbitrary injected UserDefaults. Unlike setExcludedExtensions this
+        // posts no excludedExtensionsChanged notification, which the relaunch contract makes moot.
         for key in defaults.dictionaryRepresentation().keys where !protectedKeys.contains(key) {
             defaults.removeObject(forKey: key)
         }
