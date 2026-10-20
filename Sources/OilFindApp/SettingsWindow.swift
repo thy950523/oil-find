@@ -190,6 +190,47 @@ final class SettingsModel: ObservableObject {
         onConfigChange?(); onContentChange?()
     }
     func rebuild() { manager?.rescan(); rebuilding = manager != nil }
+    /// Confirms, then performs a full settings reset. The app restarts afterwards instead of
+    /// re-reading config in place: `SettingsModel`, `IndexManager` and the registered hot key all
+    /// hold snapshots taken at launch, and re-reading three of them is more ways to go wrong than
+    /// restarting once.
+    func confirmClearAllSettings(in window: NSWindow?) {
+        guard !snapshot, let window else { return }
+        let alert = NSAlert()
+        alert.messageText = L10n.text("settings.resetAll")
+        alert.informativeText = L10n.text("settings.resetConfirm")
+        alert.addButton(withTitle: L10n.text("settings.reset"))
+        alert.addButton(withTitle: L10n.text("action.cancel"))
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.clearAllSettingsAndRelaunch()
+        }
+    }
+    private func clearAllSettingsAndRelaunch() {
+        // Arm the relaunch first: if it cannot start, nothing has been destroyed yet.
+        guard relaunch() else { return }
+        SettingsPreferences.clearAll(in: preferences)
+        // "Open at Login" is SMAppService state, not a UserDefaults preference, so `clearAll`
+        // cannot reach it. Leaving it registered would contradict the reset just confirmed.
+        if SMAppService.mainApp.status == .enabled { try? SMAppService.mainApp.unregister() }
+        NSApp.terminate(nil)
+    }
+    private func relaunch() -> Bool {
+        // Paths are positional arguments, never interpolated into shell source. Mirrors the
+        // convention in UpdateRelauncher.
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+        task.arguments = ["/bin/sh", "-c", """
+        pid="$1"; app="$2"
+        while /bin/kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.2; done
+        /usr/bin/open -n "$app"
+        """, "oilfind-settings-reset", String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundlePath]
+        task.standardInput = FileHandle.nullDevice
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return false }
+        return true
+    }
     func beginRecording(in window: NSWindow?) {
         guard !recording, let window else { return }
         shortcutError = nil; recording = true; suspendHotKey?(); onContentChange?()
@@ -390,6 +431,10 @@ private struct SettingsForm: View {
                 ExcludedExtensionsInput(model: model).frame(height: 24)
             } header: { Text(L10n.text("settings.excludedTypes")) }
               footer: { hint(L10n.text("settings.excludedTypesHint")) }
+            Section {
+                Button(L10n.text("settings.resetAll")) { model.confirmClearAllSettings(in: window()) }
+            } header: { Text(L10n.text("settings.reset")) }
+              footer: { hint(L10n.text("settings.resetHint")) }
         }
         .formStyle(.grouped).toggleStyle(.switch)
         .frame(width: 540, height: model.contentHeight)
