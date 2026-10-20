@@ -12,6 +12,8 @@ final class ContentManager: ObservableObject {
 
     @Published private(set) var enabled: Bool
     @Published private(set) var indexing = false
+    /// How far the running pass has got, or nil when none is running. Published on the main thread.
+    @Published private(set) var progress: ContentIndexProgress?
     @Published private(set) var count = 0
     @Published private(set) var diskBytes: Int64 = 0
     @Published private(set) var failed = 0
@@ -38,6 +40,10 @@ final class ContentManager: ObservableObject {
     /// interleave. `generation`/`cancelled` need the lock instead because the worker thread reads
     /// them, which this flag deliberately does not.
     private var pendingChange = false
+    /// Throttle state for `report`. Guarded by `lock` rather than main-thread-only, because the
+    /// worker queue is what calls it.
+    private var lastProgressPhase: ContentIndexProgress.Phase?
+    private var lastProgressAt: DispatchTime?
 
     /// `indexURL: nil` is completely lazy: no database is opened and no file is written. Tests pass
     /// nil so they never touch the user's real Application Support directory.
@@ -98,6 +104,10 @@ final class ContentManager: ObservableObject {
         // covered by it. Drop the pending mark so it cannot later trigger a redundant follow-up,
         // including one left over from a pass that `stop()` cancelled before its completion ran.
         pendingChange = false
+        lock.lock(); lastProgressPhase = nil; lastProgressAt = nil; lock.unlock()
+        // Cleared before the first report arrives, so a new pass cannot show the previous one's
+        // counts against a total that no longer applies.
+        progress = nil
         indexing = true
         queue.async { [weak self] in
             guard let self else { return }
@@ -106,8 +116,10 @@ final class ContentManager: ObservableObject {
             // early return here would leave the UI stuck on "indexing" forever.
             var hardFailure = false
             if let store = self.storeProvider?() {
-                do { try indexer.synchronize(store: store, isCancelled: { self.isCancelled(mine) }) }
-                catch { hardFailure = true }
+                do {
+                    try indexer.synchronize(store: store, isCancelled: { self.isCancelled(mine) },
+                                            progress: { self.report($0, mine: mine) })
+                } catch { hardFailure = true }
             }
             // Read the count on this queue: it is the writer's owner, so no statement races it.
             let total = (try? self.writer?.count()) ?? 0
@@ -115,6 +127,9 @@ final class ContentManager: ObservableObject {
             let bytes = Self.diskBytes(at: self.indexURL)
             DispatchQueue.main.async {
                 guard !self.isCancelled(mine) else { return }
+                // Cleared before `indexing`, so a reader woken by that flag never sees the finished
+                // pass's last count still sitting there.
+                self.progress = nil
                 self.indexing = false
                 self.count = total
                 self.failed = failures
@@ -137,6 +152,7 @@ final class ContentManager: ObservableObject {
     func stop() {
         lock.lock(); generation += 1; cancelled = true; lock.unlock()
         indexing = false
+        progress = nil
     }
 
     /// Stops any run and drops every indexed file.
@@ -162,6 +178,26 @@ final class ContentManager: ObservableObject {
                 self.count = total
                 self.diskBytes = bytes
             }
+        }
+    }
+
+    /// Hands a pass's progress to the main thread, at most five times a second. A phase change
+    /// always goes through: the switch from scanning to parsing is the only signal that the pass has
+    /// reached the expensive part, and on a small index it can land inside the throttle window and
+    /// otherwise never be seen.
+    private func report(_ value: ContentIndexProgress, mine: Int) {
+        lock.lock()
+        let now = DispatchTime.now()
+        let phaseChanged = value.phase != lastProgressPhase
+        let due = lastProgressAt.map { now.uptimeNanoseconds - $0.uptimeNanoseconds >= 200_000_000 } ?? true
+        guard phaseChanged || due else { lock.unlock(); return }
+        lastProgressPhase = value.phase
+        lastProgressAt = now
+        lock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            // A superseded pass must not publish over the newer one that replaced it.
+            guard let self, !self.isCancelled(mine) else { return }
+            self.progress = value
         }
     }
 

@@ -184,6 +184,53 @@ final class ContentIndexerTests: XCTestCase {
         XCTAssertEqual(indexer.failedCount, 0)
     }
 
+    /// A pass has two phases, and the settings pane can only show progress if both report a count
+    /// against a total the pane can trust. Enumeration reports against the file index's row count;
+    /// parsing reports against the candidate list, which is smaller and known only once enumeration
+    /// has finished.
+    func testProgressReportsScanningThenParsingAgainstKnownTotals() throws {
+        let entries = (0..<4).map { Entry(name: "note\($0).txt", kind: 3) }
+        // Five store rows (the synthetic root plus four entries) with a batch size of two, so
+        // scanning reports more than once and its final report is not the last full batch.
+        let indexer = ContentIndexer(index: index, parsers: [StubParser()], batchSize: 2)
+        var events: [ContentIndexProgress] = []
+
+        try indexer.synchronize(store: makeStore(entries), isCancelled: { false },
+                                progress: { events.append($0) })
+
+        let scanning = events.filter { $0.phase == .scanning }
+        XCTAssertFalse(scanning.isEmpty, "enumeration must report progress")
+        XCTAssertTrue(scanning.allSatisfy { $0.total == 5 }, "scanning totals the whole file index")
+        XCTAssertEqual(scanning.map(\.done), scanning.map(\.done).sorted(), "scanning must not go backwards")
+        XCTAssertEqual(scanning.last?.done, 5, "the final report covers every row")
+
+        let parsing = events.filter { $0.phase == .parsing }
+        XCTAssertEqual(parsing.first?.done, 0, "parsing starts at zero")
+        XCTAssertTrue(parsing.allSatisfy { $0.total == 4 }, "parsing totals the candidates, not the store")
+        XCTAssertEqual(parsing.map(\.done), parsing.map(\.done).sorted(), "parsing must not go backwards")
+        XCTAssertEqual(parsing.last?.done, 4, "every candidate is accounted for")
+        XCTAssertEqual(scanning.count + parsing.count, events.count, "no other phases exist")
+    }
+
+    /// A cancelled enumeration must stop reporting: the pane must not keep advancing a bar for a
+    /// pass that is no longer running.
+    func testCancelledEnumerationStopsReportingProgress() throws {
+        let entries = (0..<4).map { Entry(name: "note\($0).txt", kind: 3) }
+        let indexer = ContentIndexer(index: index, parsers: [StubParser()], batchSize: 2)
+        var events: [ContentIndexProgress] = []
+
+        // Cancellation is triggered by the first report rather than by an `isCancelled` call count:
+        // how often the indexer asks is an implementation detail, and a count-based trigger would
+        // silently stop testing this the moment a checkpoint moved.
+        var cancelled = false
+        try indexer.synchronize(store: makeStore(entries), isCancelled: { cancelled },
+                                progress: { events.append($0); cancelled = true })
+
+        XCTAssertFalse(events.isEmpty, "scanning must have reported before the cancellation landed")
+        XCTAssertTrue(events.allSatisfy { $0.phase == .scanning },
+                      "a cancelled pass never starts parsing")
+    }
+
     func testParserCancellationIsNotCountedAsAFailure() throws {
         // The dedicated `catch ContentParserError.cancelled` returns nil before the generic catch,
         // so a cancelled parse leaves the file to be retried without raising `failedCount`.

@@ -63,6 +63,8 @@ enum L10n {
         "contentImageText": ("图片中文字", "Text in image"),
         "contentPrivacy": ("图片和文档都在本机处理，不会上传。", "Images and documents are processed on this Mac and never uploaded."),
         "contentBuilding": ("正在建立内容索引…", "Building content index…"),
+        "contentScanning": ("正在扫描文件索引… %@ / %@", "Scanning the file index… %@ / %@"),
+        "contentParsing": ("正在解析 %@ / %@（%@%%）", "Parsing %@ / %@ (%@%%)"),
         "contentDone": ("已索引 %@ 个文件", "Indexed %@ files"),
         "contentRebuild": ("重建索引", "Rebuild index"),
         "contentClear": ("清除索引", "Clear index"),

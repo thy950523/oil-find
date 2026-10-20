@@ -23,9 +23,29 @@ struct ContentSettings: View {
         }
     }
 
+    /// The line shown while a pass runs: which phase it is in and how far it has got. The plain
+    /// sentence is the fallback for the moment before the first report arrives and for a pass with
+    /// nothing to count, where "0 / 0" would tell the user less than "building" does.
+    static func progressText(_ progress: ContentIndexProgress?, chinese: Bool) -> String {
+        guard let progress, progress.total > 0 else {
+            return L10n.text("contentBuilding", chinese: chinese)
+        }
+        let done = progress.done.formatted()
+        let total = progress.total.formatted()
+        switch progress.phase {
+        case .scanning:
+            return L10n.text("contentScanning", chinese: chinese, done, total)
+        case .parsing:
+            // Truncated rather than rounded: "100%" must mean the pass is done, not nearly done.
+            let percent = Int((Double(progress.done) / Double(progress.total) * 100).rounded(.down))
+            return L10n.text("contentParsing", chinese: chinese, done, total, String(percent))
+        }
+    }
+
     @ViewBuilder private var statusLine: some View {
         if manager.indexing {
-            Text(L10n.text("contentBuilding")).font(.footnote).foregroundStyle(.secondary)
+            Text(Self.progressText(manager.progress, chinese: L10n.chinese))
+                .font(.footnote).foregroundStyle(.secondary)
         } else {
             Text(L10n.text("contentDone", String(manager.count)) + " · "
                 + ByteCountFormatter.string(fromByteCount: manager.diskBytes, countStyle: .file))

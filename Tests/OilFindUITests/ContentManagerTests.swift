@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import OilFindCore
@@ -72,5 +73,37 @@ final class ContentManagerTests: XCTestCase {
 
         XCTAssertEqual(calls, 4, "expected the first pass plus exactly one follow-up, no more")
         XCTAssertFalse(manager.indexing)
+    }
+
+    /// The settings pane reads `progress` to show how far along a pass is. Every phase change must
+    /// reach it — including the switch from scanning to parsing, which is the only signal that the
+    /// pass has moved on to the expensive part — and the value must be cleared once the pass ends so
+    /// the pane cannot keep advancing a bar for work that is over.
+    func testProgressIsPublishedDuringAPassAndClearedWhenItEnds() throws {
+        let (suite, defaults) = makeSuite()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let manager = ContentManager(defaults: defaults, indexURL: databaseURL)
+        let store = makeEmptyStore()
+        manager.storeProvider = { store }
+
+        var seen: [ContentIndexProgress] = []
+        let published = manager.$progress.sink { if let value = $0 { seen.append(value) } }
+        defer { published.cancel() }
+
+        let finished = expectation(description: "the pass ended")
+        let indexing = manager.$indexing.dropFirst().sink { value in if !value { finished.fulfill() } }
+        defer { indexing.cancel() }
+
+        manager.setEnabled(true)
+        wait(for: [finished], timeout: 5)
+
+        // The synthetic store holds only its root, so scanning totals one row and parsing totals no
+        // candidates. Both phases still have to arrive: the pane shows the phase, not just a number.
+        XCTAssertTrue(seen.contains { $0.phase == .scanning && $0.total == 1 },
+                      "the pane never learned that scanning had started")
+        XCTAssertTrue(seen.contains { $0.phase == .parsing },
+                      "the pane never learned that parsing had started")
+        XCTAssertNil(manager.progress, "progress outlived the pass")
     }
 }

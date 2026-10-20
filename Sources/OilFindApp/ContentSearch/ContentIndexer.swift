@@ -1,6 +1,22 @@
 import Foundation
 import OilFindCore
 
+/// How far a sync pass has got, for the settings pane. A pass enumerates candidates from the file
+/// index and then parses them; both phases know their total, so the pane can show real progress
+/// instead of one unchanging sentence.
+struct ContentIndexProgress: Equatable {
+    enum Phase: Equatable {
+        /// Walking the file index for candidates. `total` is the file index's row count.
+        case scanning
+        /// Parsing candidates. `total` is the candidate count, known once enumeration finishes.
+        case parsing
+    }
+
+    let phase: Phase
+    let done: Int
+    let total: Int
+}
+
 /// Walks the file index, asks the matching parser for each document or image, and applies the
 /// resulting diff. Candidates come from the file index rather than the file system, so the index's
 /// scope, excluded folders and excluded extensions all apply automatically.
@@ -26,7 +42,8 @@ final class ContentIndexer {
         self.batchSize = batchSize
     }
 
-    func synchronize(store: IndexStore, isCancelled: () -> Bool) throws {
+    func synchronize(store: IndexStore, isCancelled: () -> Bool,
+                     progress: (ContentIndexProgress) -> Void = { _ in }) throws {
         failedCount = 0
         var candidates: [ContentFileRecord] = []
         var offset = 0
@@ -69,12 +86,24 @@ final class ContentIndexer {
             candidates.append(contentsOf: batch)
             // Advance before testing the bound: testing first would skip the final partial batch.
             offset += step
+            // Report the count read inside the lock rather than `offset`: the file index can grow
+            // while this runs, and a `done` past its own `total` would read as a bar going backwards.
+            progress(ContentIndexProgress(phase: .scanning, done: min(offset, total), total: total))
             guard offset < total else { break }
             budget.checkpoint(isCancelled: isCancelled)
         }
 
         let plan = try index.plan(candidates: candidates, complete: complete)
+        // Parsing totals what actually needs work, not the candidate count: a pass over an unchanged
+        // index parses nothing, and totalling the candidates would leave the pane at 0 of millions.
+        let work = plan.added.count + plan.changed.count
+        var parsed = 0
+        // `complete` is false only when cancellation cut the enumeration short, and that pass ends
+        // here: reporting a parsing phase that will never advance would flash a phase at the user.
+        if complete { progress(ContentIndexProgress(phase: .parsing, done: 0, total: work)) }
         try index.apply(plan) { [unowned self] record in
+            parsed += 1
+            if complete { progress(ContentIndexProgress(phase: .parsing, done: parsed, total: work)) }
             // Returning nil keeps the existing row and metadata, so a cancelled or locked file is
             // retried on the next run instead of being stored as empty.
             guard !isCancelled() else { return nil }
