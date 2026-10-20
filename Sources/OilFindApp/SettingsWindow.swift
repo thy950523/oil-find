@@ -371,6 +371,7 @@ private struct SettingsForm: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(L10n.text("coverage.title")).font(.subheadline).foregroundStyle(.secondary)
                     coverageRow("noAccess", bucket: model.coverage[.noAccess])
+                    coverageRow("ioError", bucket: model.coverage[.ioError])
                     if model.coverage.scopeCount > 0 {
                         DisclosureGroup(isExpanded: coverageBinding("scope")) {
                             VStack(alignment: .leading, spacing: 10) {

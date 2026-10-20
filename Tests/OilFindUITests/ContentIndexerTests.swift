@@ -136,6 +136,28 @@ final class ContentIndexerTests: XCTestCase {
         XCTAssertEqual(try index.count(), 1)
     }
 
+    /// A pass that runs out of descriptors must end on a record boundary, not part-way through one:
+    /// the files it never reached keep their old rows and stay candidates, so the next pass finishes
+    /// the work instead of leaving them unindexed forever.
+    func testAPassStopsWhenTheDescriptorTableIsTight() throws {
+        let entries = (0..<10).map { Entry(name: "note\($0).txt", kind: 3) }
+        let store = makeStore(entries)
+        let indexer = ContentIndexer(index: index, parsers: [StubParser()])
+        indexer.descriptorCheckInterval = 1
+        var checks = 0
+        indexer.descriptorsAreTight = { checks += 1; return checks > 3 }
+
+        try indexer.synchronize(store: store, isCancelled: { false })
+
+        XCTAssertTrue(indexer.stoppedForDescriptors)
+        XCTAssertEqual(try index.count(), 3)
+        // The stop is a pause, not a verdict: with the table healthy again the same pass finishes.
+        indexer.descriptorsAreTight = { false }
+        try indexer.synchronize(store: store, isCancelled: { false })
+        XCTAssertFalse(indexer.stoppedForDescriptors)
+        XCTAssertEqual(try index.count(), 10)
+    }
+
     func testDamagedFileIsSkippedAndCounted() throws {
         let damaged = directory.appendingPathComponent("broken.txt").path
         let store = makeStore([Entry(name: "broken.txt", kind: 3),

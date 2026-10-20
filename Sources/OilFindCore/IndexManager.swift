@@ -28,6 +28,19 @@ public final class IndexManager {
     internal var onBufferedEvents: (([FSChange]) -> Void)?
     internal var onUpdaterCreated: ((IndexUpdater) -> Void)?
     private var recoveryRescanPending = false
+    // A failed scan is retried, but never on a fixed delay. A failure whose cause is still true — a
+    // full descriptor table, a volume that is not mounted — would otherwise be retried forever at a
+    // constant cost, and a rebuild that never ends is exactly what the user sees. The delay doubles
+    // per consecutive failure and the count resets as soon as a scan publishes a catalog.
+    private var retryPending = false
+    private var consecutiveScanFailures = 0
+    internal var retryBaseDelay: TimeInterval = 60
+    internal var retryDelayLimit: TimeInterval = 900
+    // Both of the values above belong to the event queue, like the rest of the scan bookkeeping, so a
+    // reader off that queue has to hop onto it rather than take the lock.
+    internal var consecutiveScanFailuresForTesting: Int {
+        DispatchQueue.getSpecific(key: eventKey) == true ? consecutiveScanFailures : eventQueue.sync { consecutiveScanFailures }
+    }
     // Scheduling a scan does not repair the published catalog's replay interval.
     private var unresolvedLossCursor: UInt64?
     private var watcherEpoch: UInt64 = 0, scanStartEventId: UInt64 = 0
@@ -230,21 +243,31 @@ public final class IndexManager {
         }
         guard proceed else { return }
         guard let output = scanner.run(), valid(token) else {
+            // Read before leaving the scan queue: `failure` describes this run and is only meaningful
+            // until another one starts.
+            let failure = scanner.failure ?? .cancelled
             eventQueue.async {
                 guard self.valid(token) else { return }
-                self.locked { self.currentScanner = nil; self.rescanning = false; if !isRescan { self.active = false } }
+                self.locked { self.currentScanner = nil; self.rescanning = false }
+                // Whatever catalog was already published stays published. A failed scan says nothing
+                // about the disk, so withdrawing a good index would cost the user their search results
+                // for a reason that has nothing to do with the files.
                 if isRescan {
                     // Preserve the old catalog's replay cursor if opening the scan root failed.
                     if self.unresolvedLossCursor == nil { self.unresolvedLossCursor = self.store.map { store in store.read { store.lastEventId } } ?? startId }
                     _ = self.adoptScanWatcher(token: token)
-                    self.recoveryRescanPending = true
-                    self.eventQueue.asyncAfter(deadline: .now() + 60) { [weak self] in
-                        guard let self, self.valid(token) else { return }; self.startPendingRecovery()
-                    }
                 } else {
                     self.scanWatcher?.stop(); self.scanWatcher = nil; self.bufferingToken = nil
-                    self.bufferedEvents.removeAll(); self.bufferedEventBytes = 0; self.bufferedRescan = false; self.setState(.idle)
+                    self.bufferedEvents.removeAll(); self.bufferedEventBytes = 0; self.bufferedRescan = false
+                    self.setState(.idle)
                 }
+                guard failure != .cancelled else {
+                    // An interruption rather than a fault: the caller that cancelled it owns the next
+                    // move, and retrying here would fight that caller.
+                    self.locked { if !isRescan { self.active = false } }
+                    return
+                }
+                self.scheduleScanRetry(token: token)
             }; return
         }
         let s = IndexStore(scan: output, config: config)
@@ -273,6 +296,9 @@ public final class IndexManager {
             self.unresolvedLossCursor = lost ? startId : nil
             self.recoveryRescanPending = lost
             self.locked { self.currentStore = installed; self.currentScanner = nil; self.rescanning = false; self.hashMs = ms }
+            // A published catalog is the only thing that proves the retry worked, so the backoff is
+            // reset here rather than when a scan merely starts.
+            self.consecutiveScanFailures = 0; self.retryPending = false
             if let batch {
                 let callback = self.locked { self.summary = batch; return self.batchCallback }
                 DispatchQueue.main.async { callback?(batch) }
@@ -385,14 +411,50 @@ public final class IndexManager {
             rescanning = true; return generation
         }
         guard let token else { return }
+        startScan(token: token, isRescan: true, reason: reason)
+    }
+    /// Starts the scan a failure is waiting to retry. Unlike `beginRescan` this does not require a
+    /// published catalog, because the failure it answers may be the very first scan, which has none.
+    private func beginRetry(token: Int) {
+        let proceed = locked { () -> Bool in
+            guard active, !offline, !rescanning, retryPending else { return false }
+            retryPending = false; rescanning = true
+            return true
+        }
+        guard proceed else { return }
+        let isRescan = locked { currentState == .ready }
+        startScan(token: token, isRescan: isRescan, reason: "retry")
+    }
+    /// Retries a failed scan after a delay that doubles per consecutive failure. Runs on `eventQueue`.
+    private func scheduleScanRetry(token: Int) {
+        consecutiveScanFailures += 1
+        retryPending = true
+        let delay = retryDelay(afterFailures: consecutiveScanFailures)
         #if DEBUG
-        NSLog("Oil Find file rescan: reason=%@", reason)
+        NSLog("Oil Find file scan failed: failures=%d retry=%.0fs", consecutiveScanFailures, delay)
+        #endif
+        eventQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.valid(token) else { return }
+            self.beginRetry(token: token)
+        }
+    }
+    /// Doubles per consecutive failure and stops growing at the limit, so a disk that stays unreadable
+    /// is still retried — every quarter hour rather than every minute.
+    func retryDelay(afterFailures failures: Int) -> TimeInterval {
+        min(retryBaseDelay * pow(2, Double(max(1, failures) - 1)), retryDelayLimit)
+    }
+    private func startScan(token: Int, isRescan: Bool, reason: String) {
+        #if DEBUG
+        NSLog("Oil Find file rescan: reason=%@ rescan=%d", reason, isRescan ? 1 : 0)
         #endif
         let config = self.config
         onRescanStart?()
+        // Only a scan with nothing published owns the state. A rescan leaves the catalog on screen and
+        // must not make the window claim it is building an index it already has.
+        if !isRescan { setState(.scanning) }
         scanQueue.async { [weak self] in
             if let self, self.valid(token) {
-                self.scan(config: config, token: token, isRescan: true, uuid: self.deviceUUID(config: config))
+                self.scan(config: config, token: token, isRescan: isRescan, uuid: self.deviceUUID(config: config))
             }
         }
     }
@@ -447,6 +509,7 @@ public final class IndexManager {
             }
             pending.0?.cancel(); pending.1?.cancel()
             self.recoveryRescanPending = false; self.unresolvedLossCursor = nil
+            self.retryPending = false; self.consecutiveScanFailures = 0
             self.watcherEpoch &+= 1
             self.watcher?.stop(); self.watcher = nil
             self.scanWatcher?.stop(); self.scanWatcher = nil; self.bufferingToken = nil; self.bufferedEvents.removeAll(); self.bufferedEventBytes = 0; self.bufferedRescan = false

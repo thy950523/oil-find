@@ -101,6 +101,21 @@ final class TextParserTests: XCTestCase {
         }
     }
 
+    /// A file the process may not read is not a damaged one: its bytes were never seen, and the
+    /// difference is what tells a user to grant Full Disk Access rather than to distrust the file.
+    /// Both are counted the same by the indexer, so this only pins the parser's own answer.
+    func testAnUnreadableFileIsReportedAsUnreadable() throws {
+        let url = try write(Data("secret".utf8), name: "locked.txt")
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path) }
+
+        XCTAssertThrowsError(try TextParser().parse(url: url, budget: budget, isCancelled: { false })) { error in
+            guard case ContentParserError.unreadable = error else {
+                return XCTFail("expected unreadable, got \(error)")
+            }
+        }
+    }
+
     func testSingleOverlongLineIsSplitIntoBoundedChunks() throws {
         // One line with no newline at all. The old flush-before-append test never split it: the
         // buffer was empty on entry, nothing flushed, and the whole line became one chunk. A line

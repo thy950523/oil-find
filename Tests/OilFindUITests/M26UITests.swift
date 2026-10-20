@@ -292,6 +292,21 @@ extension M26UITests {
         XCTAssertEqual(controller.footer.text, L10n.text("source.unavailable", "Archive"))
         XCTAssertEqual(controller.quickLook.isVisible, previewVisible)
     }
+    /// The settings pane renders one row per reason with a non-zero count, so a reason the model drops
+    /// is a row the user never sees — and an I/O failure is the case that used to leave no trace at
+    /// all, which is why it is worth pinning separately from the reasons that were always reported.
+    func testIoErrorCoverageReachesTheSettingsModel() throws {
+        let (root, store, _) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        store.coverage.buckets[.ioError] = CoverageBucket(count: 4, examples: ["/a/locked"])
+
+        let model = SettingsModel(snapshotStore: store, snapshot: true)
+        model.refresh()
+
+        XCTAssertEqual(model.coverage[.ioError].count, 4)
+        XCTAssertEqual(model.coverage[.ioError].examples, ["/a/locked"])
+    }
+
     func testFileTypeCoverageIncludesAdditionalSources() throws {
         let (rootA, storeA, _) = try fixture(), (rootB, storeB, _) = try fixture()
         defer { try? FileManager.default.removeItem(at: rootA); try? FileManager.default.removeItem(at: rootB) }

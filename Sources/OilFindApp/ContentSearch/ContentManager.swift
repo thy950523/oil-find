@@ -123,7 +123,9 @@ final class ContentManager: ObservableObject {
             }
             // Read the count on this queue: it is the writer's owner, so no statement races it.
             let total = (try? self.writer?.count()) ?? 0
-            let failures = indexer.failedCount + (hardFailure ? 1 : 0)
+            // A pass that stopped on descriptors is counted as a failure for the same reason a hard
+            // failure is: it left work undone, and the retry the count offers is what finishes it.
+            let failures = indexer.failedCount + (indexer.stoppedForDescriptors ? 1 : 0) + (hardFailure ? 1 : 0)
             let bytes = Self.diskBytes(at: self.indexURL)
             DispatchQueue.main.async {
                 guard !self.isCancelled(mine) else { return }

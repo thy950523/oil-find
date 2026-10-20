@@ -179,4 +179,20 @@ final class ImageOCRParserTests: XCTestCase {
         try Data("this file is plain text, not a PNG image at all".utf8).write(to: url)
         XCTAssertTrue(try parser.parse(url: url, budget: budget, isCancelled: { false }).isEmpty)
     }
+
+    /// A file the process may not read is not a damaged one, and must not reach Vision: ImageIO
+    /// returns a source with no read session rather than failing, and such a source reports
+    /// `unexpectedEOF` for frame 0 — the status of a partial download — so without the type check the
+    /// file would be decoded by Vision, fail there, and be counted as corrupt. Runs on CI: no text has
+    /// to be recognised for the failure to be the expected one.
+    func testAnUnreadableImageIsReportedAsUnreadable() throws {
+        let url = try writeImage(width: 200, height: 200, text: "发票", fontSize: 40, name: "locked.png")
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path) }
+        XCTAssertThrowsError(try parser.parse(url: url, budget: budget, isCancelled: { false })) { error in
+            guard case ContentParserError.unreadable = error else {
+                return XCTFail("expected unreadable, got \(error)")
+            }
+        }
+    }
 }

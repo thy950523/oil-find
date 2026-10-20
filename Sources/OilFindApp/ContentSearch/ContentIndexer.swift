@@ -22,11 +22,23 @@ struct ContentIndexProgress: Equatable {
 /// scope, excluded folders and excluded extensions all apply automatically.
 final class ContentIndexer {
     /// Parse failures seen by the last `synchronize`. Cancellation is not counted: it is a normal
-    /// interruption, not a damaged file.
+    /// interruption, not a damaged file. A file that could not be read counts, because the pass did
+    /// not index it and the user needs the retry the count offers.
     private(set) var failedCount = 0
+    /// True when the last `synchronize` stopped early because the process was running out of
+    /// descriptors. The pass is incomplete: the files it never reached keep their old rows and stay
+    /// candidates for the next one.
+    private(set) var stoppedForDescriptors = false
     /// Instance property rather than a constant so tests can shrink it and cover the final partial
     /// batch.
     var batchSize = 20_000
+    /// How many files to parse between checks of the descriptor table. Walking `/dev/fd` costs a
+    /// `readdir` per descriptor, so checking per file would cost more than it saves; a batch bounds
+    /// how far past the threshold a pass can get.
+    var descriptorCheckInterval = 256
+    /// The check itself, injectable so a test can drive the stop without filling the process's real
+    /// descriptor table — which it cannot do without also breaking every later test in the process.
+    var descriptorsAreTight: () -> Bool = { DescriptorBudget.isTight() }
 
     private let index: ContentIndex
     private let parsers: [ContentParser]
@@ -45,6 +57,8 @@ final class ContentIndexer {
     func synchronize(store: IndexStore, isCancelled: () -> Bool,
                      progress: (ContentIndexProgress) -> Void = { _ in }) throws {
         failedCount = 0
+        stoppedForDescriptors = false
+        var untilDescriptorCheck = descriptorCheckInterval
         var candidates: [ContentFileRecord] = []
         var offset = 0
         var complete = true
@@ -101,9 +115,19 @@ final class ContentIndexer {
         // `complete` is false only when cancellation cut the enumeration short, and that pass ends
         // here: reporting a parsing phase that will never advance would flash a phase at the user.
         if complete { progress(ContentIndexProgress(phase: .parsing, done: 0, total: work)) }
-        try index.apply(plan) { [unowned self] record in
+        try index.apply(plan, shouldStop: { stoppedForDescriptors }) { [unowned self] record in
             parsed += 1
             if complete { progress(ContentIndexProgress(phase: .parsing, done: parsed, total: work)) }
+            // Opening one file per item for hours can fill the descriptor table without any single
+            // failure being visible, and the damage is not confined to this pass: a file scan running
+            // in the same process cannot open directories once `open` starts failing with EMFILE, and a
+            // directory it cannot open looks like one it already read. Stop while there is headroom
+            // rather than discovering the limit through a catalog that lost whole subtrees.
+            untilDescriptorCheck -= 1
+            if untilDescriptorCheck <= 0 {
+                untilDescriptorCheck = descriptorCheckInterval
+                if descriptorsAreTight() { stoppedForDescriptors = true; return nil }
+            }
             // Returning nil keeps the existing row and metadata, so a cancelled or locked file is
             // retried on the next run instead of being stored as empty.
             guard !isCancelled() else { return nil }

@@ -22,5 +22,10 @@ enum ContentParserError: Error {
     case unsupported
     case tooLarge
     case damaged
+    /// The file could not be read at all — it is locked, or the process has no descriptor left to
+    /// open it with. Kept apart from `damaged`, which says the bytes were read and are unusable:
+    /// only one of the two is worth retrying after the cause is removed, and only one of them means
+    /// the file itself is at fault.
+    case unreadable
     case cancelled
 }

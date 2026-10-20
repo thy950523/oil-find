@@ -26,6 +26,17 @@ public struct ScanOutput {
     public let finishedAt: UInt64
     public var coverage = CoverageStats()
 }
+/// Why a scan published nothing. Meaningful only after `run` has returned.
+public enum ScanFailure: Equatable {
+    /// Cancelled, or already run: nothing is wrong with the file system and no catalog is expected.
+    case cancelled
+    /// The scan root could not be opened as a directory.
+    case rootUnavailable
+    /// The process ran out of file descriptors partway through. The walk is incomplete, and every
+    /// directory it could not open is missing from the result without leaving a coverage record
+    /// that could be told apart from a directory that was simply empty.
+    case descriptorsExhausted
+}
 private struct DirTask {
     var path: [UInt8], name: [UInt8], parentName: [UInt8], grandparentName: [UInt8]
     var fileid: UInt64, dev: Int32
@@ -79,7 +90,11 @@ public final class Scanner {
     private var descriptors: [DirectoryDescriptor] = []
     private var active = 0, nextId: UInt32 = 1
     private var cancelled = false
+    // Kept apart from `cancelled` because the two mean opposite things to a caller: a cancelled scan
+    // is a normal interruption, while this one failed and its result must be discarded.
+    private var aborted = false
     private var runStarted = false
+    private var failureValue: ScanFailure?
     private var coverage = CoverageStats()
     private let coverageLock = NSLock()
     private var home: UInt32 = UInt32.max
@@ -105,8 +120,31 @@ public final class Scanner {
         directoryCompletionHook = hook.map { DirectoryOpenHook($0) }
     }
     public var scannedCount: Int { condition.lock(); defer { condition.unlock() }; return Int(nextId) }
+    /// Why `run` published nothing, or nil when it published a catalog. Read after `run` returns.
+    public var failure: ScanFailure? { condition.lock(); defer { condition.unlock() }; return failureValue }
+    /// `EMFILE` and `ENFILE` describe the process's own descriptor table, not the file system, so a
+    /// scan that meets one cannot make progress by carrying on: every later directory fails the
+    /// same way and is dropped from the result without a trace.
+    private static func isDescriptorExhaustion(_ code: Int32) -> Bool { code == EMFILE || code == ENFILE }
+    /// Which failure a scan root that could not be opened means, from the code `open` left in errno.
+    /// Internal rather than private so tests can assert the classification without a file system that
+    /// can be made to run out of descriptors on demand.
+    static func rootFailure(openCode code: Int32) -> ScanFailure {
+        isDescriptorExhaustion(code) ? .descriptorsExhausted : .rootUnavailable
+    }
+    /// Records a descriptor-exhaustion failure and stops every worker. Called with `condition` held.
+    private func abortForDescriptors() {
+        aborted = true; failureValue = .descriptorsExhausted; condition.broadcast()
+    }
+    /// Records a directory that could not be opened. Permissions and everything else are kept in
+    /// separate buckets because only one of them is fixed by granting Full Disk Access.
+    private func recordOpenFailure(_ code: Int32, _ path: UnsafeBufferPointer<UInt8>) {
+        record(code == EPERM || code == EACCES ? .noAccess : .ioError, path)
+    }
     public func cancel() {
-        condition.lock(); cancelled = true; condition.broadcast()
+        // Recorded here so that `run` returning nil always has a reason attached, whether the scan was
+        // cancelled before it started, during the walk, or not at all.
+        condition.lock(); cancelled = true; failureValue = failureValue ?? .cancelled; condition.broadcast()
         descriptorLock.lock(); let handles = descriptors; descriptorLock.unlock()
         condition.unlock()
         for handle in handles { handle.close() }
@@ -135,23 +173,32 @@ public final class Scanner {
     }
     public func run() -> ScanOutput? {
         condition.lock()
-        guard !runStarted && !cancelled else { condition.unlock(); return nil }
+        guard !runStarted && !cancelled else { failureValue = .cancelled; condition.unlock(); return nil }
         runStarted = true
         let directoryOpenHook = self.directoryOpenHook, directoryCompletionHook = self.directoryCompletionHook
         condition.unlock()
         let start = CFAbsoluteTimeGetCurrent()
         if config.rootPath == "/" { coverage.refreshVolumes() }
         let rootFD = config.rootPath.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
-        guard rootFD >= 0 else { return nil }
+        guard rootFD >= 0 else {
+            // A root that cannot be opened yields no catalog at all. Reporting which of the two
+            // reasons it was lets the caller distinguish a missing volume from a process that has
+            // spent its descriptors, which need different responses.
+            let code = errno
+            condition.lock()
+            failureValue = Self.rootFailure(openCode: code)
+            condition.unlock()
+            return nil
+        }
         var rootStat = stat()
         let rootValid = fstat(rootFD, &rootStat) == 0 && (rootStat.st_mode & S_IFMT) == S_IFDIR
         close(rootFD)
-        guard rootValid else { return nil }
+        guard rootValid else { condition.lock(); failureValue = .rootUnavailable; condition.unlock(); return nil }
         let rootDev = Int32(rootStat.st_dev)
         allowedDevices = [rootDev]
         if config.rootPath == "/", let dataDev = device("/System/Volumes/Data") { allowedDevices.insert(dataDev) }
         condition.lock()
-        guard !cancelled else { condition.unlock(); return nil }
+        guard !cancelled else { failureValue = .cancelled; condition.unlock(); return nil }
         var rootTaskPath = Array(config.rootPath.utf8); rootTaskPath.append(0)
         let rootIsPackage = Array((config.rootPath as NSString).lastPathComponent.utf8).withUnsafeBufferPointer { Classifier.isPackageExtension($0) }
         tasks = (excluded(Array(config.rootPath.utf8)) || (!config.indexPackageContents && rootIsPackage)) ? [] : [DirTask(path: rootTaskPath, name: [], parentName: [], grandparentName: [], fileid: UInt64(rootStat.st_ino), dev: rootDev, id: 0, depth: UInt8(min(config.rootPath.split(separator: "/").count, 255)), inherited: 0)]
@@ -166,8 +213,8 @@ public final class Scanner {
             defer { scratch.deallocate(); entries.deallocate(); bufferSlots[worker] = local }
             while true {
                 condition.lock()
-                while tasks.isEmpty && active > 0 && !cancelled { condition.wait() }
-                if cancelled || (tasks.isEmpty && active == 0) { condition.unlock(); break }
+                while tasks.isEmpty && active > 0 && !cancelled && !aborted { condition.wait() }
+                if cancelled || aborted || (tasks.isEmpty && active == 0) { condition.unlock(); break }
                 let task = tasks.removeLast(); active += 1; condition.unlock()
                 var children: [DirTask] = []
                 do {
@@ -177,7 +224,7 @@ public final class Scanner {
                         directoryOpenHook.call(String(decoding: relative, as: UTF8.self))
                         directoryOpenHookLock.unlock()
                     }
-                    condition.lock(); let shouldStop = cancelled; condition.unlock()
+                    condition.lock(); let shouldStop = cancelled || aborted; condition.unlock()
                     if shouldStop { condition.lock(); active -= 1; condition.broadcast(); condition.unlock(); continue }
                     let fd = task.path.withUnsafeBufferPointer {
                         open(UnsafeRawPointer($0.baseAddress!).assumingMemoryBound(to: CChar.self), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -191,12 +238,24 @@ public final class Scanner {
                         let isHome = task.path.dropLast().elementsEqual(homeBytes)
                         let inherited = task.name.withUnsafeBufferPointer { n in task.grandparentName.withUnsafeBufferPointer { p in Classifier.inheritedForChildren(dirFlags: task.id == 0 ? SiftFlag.dir : task.inherited, dirName: n, dirDepth: task.depth, parentName: p, isHome: isHome) } }
                         while true {
-                            condition.lock(); let beforeRead = cancelled; condition.unlock()
+                            condition.lock(); let beforeRead = cancelled || aborted; condition.unlock()
                             if beforeRead { break }
                             let n = handle.use { sift_read_dir($0, scratch, scratchSize, entries, Int32(scratchSize / 32)) }
-                            condition.lock(); let stop = cancelled; condition.unlock()
+                            condition.lock(); let stop = cancelled || aborted; condition.unlock()
                             if stop { break }
-                            if n <= 0 { if n < 0 && (errno == EPERM || errno == EACCES) { task.path.dropLast().withContiguousStorageIfAvailable { record(.noAccess, $0) } }; break }
+                            if n <= 0 {
+                                if n < 0 {
+                                    // `sift_read_dir` reports its own errors (EIO, ENOBUFS) and passes
+                                    // the kernel's through, so errno describes this read.
+                                    let code = errno
+                                    if Self.isDescriptorExhaustion(code) {
+                                        condition.lock(); abortForDescriptors(); condition.unlock()
+                                    } else {
+                                        task.path.dropLast().withContiguousStorageIfAvailable { recordOpenFailure(code, $0) }
+                                    }
+                                }
+                                break
+                            }
                             var batch: [Candidate] = []
                             batch.reserveCapacity(Int(n))
                             for i in 0..<Int(n) {
@@ -270,8 +329,16 @@ public final class Scanner {
                                 }
                             }
                         }
-                    } else if errno == EPERM || errno == EACCES {
-                        task.path.dropLast().withContiguousStorageIfAvailable { record(.noAccess, $0) }
+                    } else {
+                        let code = errno
+                        if Self.isDescriptorExhaustion(code) {
+                            // Every remaining directory would fail the same way, and the catalog
+                            // would claim the disk is smaller than it is. Stop and let the caller
+                            // report a failed scan instead of publishing that.
+                            condition.lock(); abortForDescriptors(); condition.unlock()
+                        } else {
+                            task.path.dropLast().withContiguousStorageIfAvailable { recordOpenFailure(code, $0) }
+                        }
                     }
                 }
                 if let directoryCompletionHook {
@@ -281,8 +348,11 @@ public final class Scanner {
                 condition.lock(); tasks.append(contentsOf: children); active -= 1; condition.broadcast(); condition.unlock()
             }
         }
-        condition.lock(); let wasCancelled = cancelled, count = Int(nextId), homeIndex = home; condition.unlock()
-        if wasCancelled { return nil }
+        condition.lock(); let wasCancelled = cancelled, wasAborted = aborted, count = Int(nextId), homeIndex = home; condition.unlock()
+        // An aborted walk covers part of the disk, so its catalog would be published as if it were the
+        // whole of it — and the caller would have no way to tell the difference. Report the failure
+        // instead and let the caller decide whether to keep the previous catalog.
+        if wasCancelled || wasAborted { return nil }
         let buffers = bufferSlots.snapshot()
         return ScanOutput(buffers: buffers, count: count, homeIndex: homeIndex, elapsed: CFAbsoluteTimeGetCurrent() - start, finishedAt: UInt64(Date().timeIntervalSince1970), coverage: coverage)
     }

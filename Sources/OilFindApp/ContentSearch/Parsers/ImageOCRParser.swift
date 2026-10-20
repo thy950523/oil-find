@@ -53,6 +53,14 @@ struct ImageOCRParser: ContentParser {
         if CGImageSourceGetStatusAtIndex(source, 0) == .statusUnknownType {
             return []
         }
+        // Everything past that check has readable bytes, because the type is taken from the header and
+        // a header that could not be read leaves it nil. ImageIO hands back a source for a file it
+        // cannot read at all — one the process may not open, or one it cannot open because its
+        // descriptor table is full — rather than failing, and that source reports `unexpectedEOF` for
+        // frame 0, which is otherwise the transient state of a partial download. Without this guard
+        // the file reaches Vision, fails to decode there, and is reported as damaged, so a locked file
+        // would look like a corrupt one and every later pass would retry it the same way.
+        guard CGImageSourceGetType(source) != nil else { throw ContentParserError.unreadable }
         let request = VNRecognizeTextRequest()
         request.revision = Self.revision
         request.recognitionLevel = .accurate

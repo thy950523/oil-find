@@ -22,6 +22,10 @@ struct TextParser: ContentParser {
         do {
             data = try Data(contentsOf: url, options: .mappedIfSafe)
         } catch {
+            // A file the process may not read is not a damaged one: its bytes were never seen, and the
+            // difference is what tells a user to grant Full Disk Access rather than to distrust the
+            // file. Foundation reports a permission failure as this Cocoa code, not as the POSIX one.
+            if (error as NSError).code == NSFileReadNoPermissionError { throw ContentParserError.unreadable }
             throw ContentParserError.damaged
         }
         guard data.count <= maximumBytes else { throw ContentParserError.tooLarge }

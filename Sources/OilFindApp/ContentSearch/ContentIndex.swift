@@ -597,7 +597,13 @@ extension ContentIndex {
     /// Committing the metadata first would mark the file `unchanged` and never retry. An empty
     /// array is a different answer: the file parsed and genuinely has no text, so its chunks are
     /// cleared and its new metadata is stored.
-    func apply(_ plan: SyncPlan, parse: (ContentFileRecord) -> [ContentChunk]?) throws {
+    ///
+    /// `shouldStop` is consulted before each parse and between chunks. A caller that has lost its
+    /// ability to read files — the descriptor table is full — can then end the pass on a record
+    /// boundary, leaving every record it did not reach unparsed and therefore still `changed` for
+    /// the next run. Stopping after a completed transaction never leaves a half-written file.
+    func apply(_ plan: SyncPlan, shouldStop: () -> Bool = { false },
+               parse: (ContentFileRecord) -> [ContentChunk]?) throws {
         // Deletions do no parsing, so one transaction over the whole list is bounded by the delete
         // count, matching `removeFiles(prefix:)`. `removeFile` probes before its own transaction, so
         // no statement is active when this `BEGIN IMMEDIATE` runs.
@@ -611,11 +617,13 @@ extension ContentIndex {
                 ?? records.endIndex
             try transaction {
                 for record in records[start..<end] {
+                    guard !shouldStop() else { return }
                     guard let chunks = parse(record) else { continue }
                     try store(file: record, chunks: chunks)
                 }
             }
             start = end
+            if shouldStop() { break }
         }
     }
 }

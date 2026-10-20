@@ -2,7 +2,12 @@ import Foundation
 import Darwin
 
 public enum CoverageReason: String, Codable, CaseIterable {
-    case noAccess, dependency, packages, library, system, userExcluded, fileType, cloud, volumes
+    /// A directory the process could not open for a reason that is not permissions. Distinct from
+    /// `noAccess` because the remedy is different: granting Full Disk Access fixes one and not the
+    /// other, so reporting an I/O failure as a permission problem would send the user to the wrong
+    /// setting. Recorded so a subtree that could not be read leaves a trace: without it the only
+    /// evidence is a catalog that is quietly smaller than the disk.
+    case noAccess, ioError, dependency, packages, library, system, userExcluded, fileType, cloud, volumes
     public var scopeKey: String? {
         switch self {
         case .dependency: return "dependency"
