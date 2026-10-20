@@ -11,9 +11,11 @@ enum AppLog {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let externalDrives: ExternalDriveCatalog
     private let appExtension: ApplicationExtension?
-    init(appExtension: ApplicationExtension? = nil, externalDrives: ExternalDriveCatalog = ExternalDriveCatalog()) {
+    private let permissionProbe: () -> Bool
+    init(appExtension: ApplicationExtension? = nil, externalDrives: ExternalDriveCatalog = ExternalDriveCatalog(), permissionProbe: @escaping () -> Bool = Permissions.hasFullDiskAccess) {
         self.externalDrives = externalDrives
         self.appExtension = appExtension
+        self.permissionProbe = permissionProbe
         super.init()
     }
     private let panel = SearchPanel()
@@ -35,10 +37,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var secondaryInstance = false
     private var openItem: NSMenuItem?, hotKeyFailureItem: NSMenuItem?
     private var permissionTimer: Timer?
+    private var permissionObserver: NSObjectProtocol?
     private var welcomeController: WelcomeWindowController?
     private var welcomeState: WelcomeState?
     private var indexStateStartedAt = ProcessInfo.processInfo.systemUptime
-    private var limited = false
+    // Full Disk Access can be granted while the app runs, so the scope is re-read rather than
+    // fixed at launch. `hasFullDiskAccess` caches the latest reading for the UI.
+    private var permission = FullDiskAccessState(limited: false)
+    private var hasFullDiskAccess = false
     private var countItem: NSMenuItem?, limitedItem: NSMenuItem?, loginItem: NSMenuItem?, rescanItem: NSMenuItem?
     static let dbURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Oil Find/index.oilfind")
     private static let showRequest = Notification.Name("com.oiloil.find.show")
@@ -55,6 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UpdateManager.shared.onChange = { [weak self] in self?.refreshUpdateMenu() }
         NSApp.setActivationPolicy(.accessory)
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(reopenRequested(_:)), name: Self.showRequest, object: nil)
+        permissionObserver = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.refreshPermission() }
         let defaults = UserDefaults.standard
         let key = (defaults.object(forKey: "hotKeyCode") as? NSNumber)?.uint32Value ?? UInt32(kVK_ANSI_F)
         let modifiers = (defaults.object(forKey: "hotKeyModifiers") as? NSNumber)?.uint32Value ?? UInt32(cmdKey | shiftKey)
@@ -73,7 +80,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         externalDrives.start()
         appExtension?.start(chinese: L10n.chinese, showSettings: { [weak self] in self?.presentSettings() })
         panel.searchController.onSettings = { [weak self] in self?.showSettings() }
-        let fullDiskAccess = Permissions.hasFullDiskAccess()
+        panel.searchController.permissionGranted = { [weak self] in self?.hasFullDiskAccess ?? true }
+        panel.searchController.onWillShow = { [weak self] in self?.refreshPermission() }
+        refreshPermission()
+        let fullDiskAccess = hasFullDiskAccess
         var state = WelcomeState(didFinishOnboarding: defaults.bool(forKey: "didFinishOnboarding"), skippedFullDiskAccess: defaults.bool(forKey: "skippedFullDiskAccess"), granted: fullDiskAccess)
         let indexRequest = state.launch()
         welcomeState = state
@@ -86,7 +96,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             controller.present()
             permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
                 guard let self else { return }
-                let granted = Permissions.hasFullDiskAccess()
+                self.refreshPermission()
+                let granted = self.hasFullDiskAccess
                 self.welcomeController?.model.granted = granted
                 if granted { self.welcomeController?.model.waiting = false }
                 if let limited = self.welcomeState?.permissionDetected(granted) { self.startIndex(limited: limited) }
@@ -99,7 +110,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private func finishWelcome(source: PanelSource = .welcome) {
         guard welcomeState?.isShowing == true else { return }
-        let detected = welcomeState?.permissionDetected(Permissions.hasFullDiskAccess())
+        refreshPermission()
+        let detected = welcomeState?.permissionDetected(hasFullDiskAccess)
         let finished = welcomeState?.finish()
         let request = detected ?? finished
         let defaults = UserDefaults.standard
@@ -115,9 +127,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else { panel.toggle(source: .hotkey) }
     }
 
+    /// Re-reads Full Disk Access and applies a changed reading to the running index. Callers are
+    /// the moments the user could have just come back from System Settings; nothing else notices,
+    /// because the welcome window that owns the permission prompt is gone after onboarding.
+    private func refreshPermission() {
+        let granted = permissionProbe()
+        hasFullDiskAccess = granted
+        guard permission.observe(granted: granted) else { return }
+        AppLog.logger.info("permission changed granted=\(granted, privacy: .public) limited=\(self.permission.limited, privacy: .public)")
+        manager?.updateConfig(SettingsPreferences.indexConfig(limited: permission.limited))
+    }
+
     private func startIndex(limited: Bool) {
         guard manager == nil else { return }
-        self.limited = limited
+        permission = FullDiskAccessState(limited: limited)
         let manager = IndexManager(config: SettingsPreferences.indexConfig(limited: limited), dbURL: Self.dbURL)
         self.manager = manager; panel.searchController.manager = manager
         // The supplementary slot is single and the app extension owns it, so wrap both providers
@@ -214,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             model.registerHotKey = { [weak self] code, mask in self?.registerHotKey(keyCode: code, modifiers: mask) ?? false }
             model.onConfigChange = { [weak self] in
                 guard let self else { return }
-                self.manager?.updateConfig(SettingsPreferences.indexConfig(limited: self.limited))
+                self.manager?.updateConfig(SettingsPreferences.indexConfig(limited: self.permission.limited))
             }
             model.onPinyinChange = { [weak self] in self?.panel.searchController.startSearch(preserveSelection: true) }
             settingsController = SettingsWindowController(model: model, appExtension: appExtension, externalDrives: externalDrives)
@@ -222,11 +245,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settingsController?.present()
     }
     func menuWillOpen(_ menu: NSMenu) {
+        refreshPermission()
         refreshExtensionMenu()
         refreshUpdateMenu()
         if let store = manager?.store { countItem?.title = L10n.text("menu.indexed", Presentation.countText(store.read { store.liveCount })) }
         else { countItem?.title = L10n.text("menu.indexing") }
-        limitedItem?.isHidden = !limited
+        limitedItem?.isHidden = !permission.limited
         rescanItem?.isEnabled = manager?.state == .ready && manager?.isRescanning == false
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
@@ -286,5 +310,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for url in urls { appExtension?.handle(url) }
     }
     func applicationWillTerminate(_ notification: Notification) { if !secondaryInstance { topics.stop(); contentSearch.stop(); appExtension?.stop(); externalDrives.stop(); UpdateManager.shared.stop() }; settingsController?.model.stopRefreshing(); permissionTimer?.invalidate(); hotKey?.unregister(); manager?.stop() }
-    deinit { if let languageObserver { NotificationCenter.default.removeObserver(languageObserver) } }
+    deinit {
+        if let languageObserver { NotificationCenter.default.removeObserver(languageObserver) }
+        if let permissionObserver { NotificationCenter.default.removeObserver(permissionObserver) }
+    }
 }

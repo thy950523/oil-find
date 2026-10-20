@@ -67,4 +67,16 @@ final class ApplicationMenuTests: XCTestCase {
         XCTAssertEqual(menu.items[settings].title, "设置…")
         XCTAssertEqual(menu.items[settings + 1].title, "扩展设置…")
     }
+    func testLimitedModeItemFollowsFullDiskAccessGrantedWhileRunning() throws {
+        _ = NSApplication.shared
+        var granted = false
+        let delegate = AppDelegate(permissionProbe: { granted })
+        let menu = delegate.makeMenu()
+        let limited = try XCTUnwrap(menu.items.first { $0.title == L10n.text("menu.limited") })
+        delegate.menuWillOpen(menu)
+        XCTAssertFalse(limited.isHidden)
+        granted = true
+        delegate.menuWillOpen(menu)
+        XCTAssertTrue(limited.isHidden)
+    }
 }

@@ -45,6 +45,12 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         footer.spacePreview = browsing && previewWithSpace
     }
     var manager: IndexManager?
+    /// Reads the app's latest Full Disk Access reading. Asking for the permission is a call to
+    /// action, so it only belongs on screen while the permission is actually missing.
+    var permissionGranted: () -> Bool = { true }
+    /// Called as the panel becomes visible, which is when the user is most likely to have just
+    /// returned from System Settings.
+    var onWillShow: (() -> Void)?
     var supplementaryProvider: SupplementarySearchProvider?
     var additionalSearchProvider: AdditionalSearchProvider? {
         didSet {
@@ -211,6 +217,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     func panelWillShow() {
+        onWillShow?()
         additionalSearchProvider?.visibilityChanged(true)
         setBrowsing(false)
         supplementaryProvider?.userActivity(visible: true, typing: false)
@@ -376,8 +383,15 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         diagnostics = query.diagnostics
         configureEmpty(result); updateFooter(result)
     }
+    /// Asking for Full Disk Access is the prompt's only action, so it stays off screen while the
+    /// permission is already granted: the entries the bucket still holds are paths the system
+    /// protects from every app, and granting again would not reach them. The scope is re-read
+    /// while the app runs, so a stale reading cannot keep the prompt alive either.
+    static func showsAccessPrompt(override: Bool, granted: Bool, sources: [SearchSource]) -> Bool {
+        override || (!granted && sources.contains { source in source.store.read { source.store.coverage[.noAccess].count > 0 } })
+    }
     private func configureEmpty(_ result: SearchPresentation) {
-        empty.configure(diagnostic: diagnostics.first, hasNoAccess: snapshotNoAccess || result.sources.contains { source in source.store.read { source.store.coverage[.noAccess].count > 0 } })
+        empty.configure(diagnostic: diagnostics.first, hasNoAccess: Self.showsAccessPrompt(override: snapshotNoAccess, granted: permissionGranted(), sources: result.sources))
     }
     func toggleSyntax(_ show: Bool? = nil) {
         let visible = show ?? !syntaxVisible
