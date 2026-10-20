@@ -3,9 +3,9 @@ import Darwin
 import COilFind
 
 public struct EntryAttrs {
-    public var type: UInt32, bsdFlags: UInt32, size: UInt64, mtime: Int64
-    public init(type: UInt32, bsdFlags: UInt32 = 0, size: UInt64 = 0, mtime: Int64 = 0) {
-        self.type = type; self.bsdFlags = bsdFlags; self.size = size; self.mtime = mtime
+    public var type: UInt32, bsdFlags: UInt32, size: UInt64, mtime: Int64, mtimeNsec: Int64
+    public init(type: UInt32, bsdFlags: UInt32 = 0, size: UInt64 = 0, mtime: Int64 = 0, mtimeNsec: Int64 = 0) {
+        self.type = type; self.bsdFlags = bsdFlags; self.size = size; self.mtime = mtime; self.mtimeNsec = mtimeNsec
     }
 }
 
@@ -87,7 +87,7 @@ extension IndexStore {
         if count < capacity { return }
         capacity = max(count + 1, capacity + max(1, capacity / 2))
         grow(&nameOff, to: capacity + 1); grow(&parent, to: capacity)
-        grow(&sizeC, to: capacity); grow(&mtime, to: capacity)
+        grow(&sizeC, to: capacity); grow(&mtime, to: capacity); grow(&mtimeNsec, to: capacity)
         grow(&flags, to: capacity); grow(&depth, to: capacity); grow(&kind, to: capacity)
     }
     private func appendAlt(_ bytes: [UInt8], owner: UInt32) {
@@ -116,7 +116,7 @@ extension IndexStore {
         parent[n] = p; depth[n] = UInt8(min(Int(depth[pi]) + 1, 255))
         flags[n] = Classifier.flags(name: name, type: attrs.type, bsdFlags: attrs.bsdFlags, inherited: inherited)
         kind[n] = Classifier.kind(name: name, flags: flags[n])
-        sizeC[n] = attrs.type == 1 ? 0 : Self.encodeSize(attrs.size); mtime[n] = UInt32(clamping: attrs.mtime)
+        sizeC[n] = attrs.type == 1 ? 0 : Self.encodeSize(attrs.size); mtime[n] = UInt32(clamping: attrs.mtime); mtimeNsec[n] = UInt32(clamping: attrs.mtimeNsec)
         nameOff[n] = UInt32(namesLen)
         if !name.isEmpty { names.advanced(by: namesLen).update(from: name.baseAddress!, count: name.count) }
         namesLen += name.count; count += 1; nameOff[count] = UInt32(namesLen); liveCount += 1
@@ -154,7 +154,7 @@ extension IndexStore {
         if !caseSensitiveNames && old.count == name.count && !old.elementsEqual(name) && sift_name_equal_folded(old.baseAddress, old.count, name.baseAddress, name.count) != 0 && !name.isEmpty {
             names.advanced(by: Int(nameOff[n])).update(from: name.baseAddress!, count: name.count)
         }
-        sizeC[n] = attrs.type == 1 ? 0 : Self.encodeSize(attrs.size); mtime[n] = UInt32(clamping: attrs.mtime)
+        sizeC[n] = attrs.type == 1 ? 0 : Self.encodeSize(attrs.size); mtime[n] = UInt32(clamping: attrs.mtime); mtimeNsec[n] = UInt32(clamping: attrs.mtimeNsec)
         let p = Int(parent[n])
         let inherited = Classifier.inheritedForChildren(dirFlags: flags[p], dirName: nameBytes(parent[n]), dirDepth: depth[p], parentName: nameBytes(parent[Int(parent[p])]), isHome: UInt32(p) == homeIndex)
         flags[n] = Classifier.flags(name: name, type: attrs.type, bsdFlags: attrs.bsdFlags, inherited: inherited)
@@ -187,7 +187,7 @@ extension IndexStore {
         for i in 0..<count where map[i] != UInt32.max {
             let n = Int(map[i]), len = Int(nameOff[i+1] - nameOff[i])
             s.nameOff[n] = UInt32(pos); s.parent[n] = map[Int(parent[i])]
-            s.sizeC[n] = sizeC[i]; s.mtime[n] = mtime[i]; s.flags[n] = flags[i]; s.depth[n] = depth[i]; s.kind[n] = kind[i]
+            s.sizeC[n] = sizeC[i]; s.mtime[n] = mtime[i]; s.mtimeNsec[n] = mtimeNsec[i]; s.flags[n] = flags[i]; s.depth[n] = depth[i]; s.kind[n] = kind[i]
             if len > 0 { s.names.advanced(by: pos).update(from: names.advanced(by: Int(nameOff[i])), count: len) }; pos += len
         }
         s.nameOff[entries] = UInt32(pos); pos = 0; var a = 0

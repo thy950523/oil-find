@@ -5,10 +5,12 @@ import COilFind
 public struct ScanBuffer {
     public init() {}
     public var ids: [UInt32] = [], parents: [UInt32] = [], sizes: [UInt32] = [], mtimes: [UInt32] = []
+    /// Sub-second part of `mtimes`, 0..999_999_999. Parallel to every other array here.
+    public var mtimesNsec: [UInt32] = []
     public var flags: [UInt8] = [], depths: [UInt8] = [], kinds: [UInt8] = []
     public var nameLens: [UInt32] = [], nameBytes: [UInt8] = []
-    mutating func append(id: UInt32, parent: UInt32, size: UInt32, mtime: UInt32, flags: UInt8, depth: UInt8, kind: UInt8, name: UnsafeBufferPointer<UInt8>) {
-        ids.append(id); parents.append(parent); sizes.append(size); mtimes.append(mtime)
+    mutating func append(id: UInt32, parent: UInt32, size: UInt32, mtime: UInt32, mtimeNsec: UInt32 = 0, flags: UInt8, depth: UInt8, kind: UInt8, name: UnsafeBufferPointer<UInt8>) {
+        ids.append(id); parents.append(parent); sizes.append(size); mtimes.append(mtime); mtimesNsec.append(mtimeNsec)
         self.flags.append(flags); depths.append(depth); kinds.append(kind)
         nameLens.append(UInt32(name.count)); nameBytes.append(contentsOf: name)
     }
@@ -32,7 +34,7 @@ private struct DirTask {
 private struct Candidate {
     var path: [UInt8]?, namePtr: UnsafePointer<UInt8>, nameLen: Int, normalized: [UInt8]?
     var fileid: UInt64, dev: Int32
-    var type: UInt32, bsdFlags: UInt32, size: UInt64, mtime: Int64, parent: UInt32, depth: UInt8, inherited: UInt8
+    var type: UInt32, bsdFlags: UInt32, size: UInt64, mtime: Int64, mtimeNsec: Int64, parent: UInt32, depth: UInt8, inherited: UInt8
     func withName<T>(_ body: (UnsafeBufferPointer<UInt8>) -> T) -> T {
         if let normalized { return normalized.withUnsafeBufferPointer(body) }
         return body(UnsafeBufferPointer(start: namePtr, count: nameLen))
@@ -251,7 +253,7 @@ public final class Scanner {
                                     path.append(0)
                                     childPath = path
                                 }
-                                batch.append(Candidate(path: childPath, namePtr: raw.baseAddress!, nameLen: raw.count, normalized: normalized, fileid: e.fileid, dev: e.dev, type: e.type, bsdFlags: e.bsd_flags, size: e.size, mtime: e.mtime, parent: task.id, depth: UInt8(min(Int(task.depth) + 1, 255)), inherited: inherited))
+                                batch.append(Candidate(path: childPath, namePtr: raw.baseAddress!, nameLen: raw.count, normalized: normalized, fileid: e.fileid, dev: e.dev, type: e.type, bsdFlags: e.bsd_flags, size: e.size, mtime: e.mtime, mtimeNsec: e.mtime_nsec, parent: task.id, depth: UInt8(min(Int(task.depth) + 1, 255)), inherited: inherited))
                             }
                             condition.lock(); let base = nextId; nextId &+= UInt32(batch.count); condition.unlock()
                             for (offset, item) in batch.enumerated() {
@@ -259,7 +261,7 @@ public final class Scanner {
                                 let f = item.withName { Classifier.flags(name: $0, type: item.type, bsdFlags: item.bsdFlags, inherited: item.inherited) }
                                 let k = item.withName { Classifier.kind(name: $0, flags: f) }
                                 let size = item.type == 1 ? UInt32(0) : IndexStore.encodeSize(item.size)
-                                item.withName { local.append(id: id, parent: item.parent, size: size, mtime: UInt32(clamping: item.mtime), flags: f, depth: item.depth, kind: k, name: $0) }
+                                item.withName { local.append(id: id, parent: item.parent, size: size, mtime: UInt32(clamping: item.mtime), mtimeNsec: UInt32(clamping: item.mtimeNsec), flags: f, depth: item.depth, kind: k, name: $0) }
                                 if let path = item.path {
                                     if path.dropLast().elementsEqual(homeBytes) { condition.lock(); home = id; condition.unlock() }
                                     if item.bsdFlags & UInt32(SF_DATALESS) != 0 { path.dropLast().withContiguousStorageIfAvailable { record(.cloud, $0) } }

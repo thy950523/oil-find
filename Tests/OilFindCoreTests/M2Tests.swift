@@ -33,13 +33,13 @@ final class M2Tests: XCTestCase {
         }
     }
     private struct Attributes: Equatable {
-        let size: UInt32, mtime: UInt32, flags: UInt8, depth: UInt8, kind: UInt8
+        let size: UInt32, mtime: UInt32, mtimeNsec: UInt32, flags: UInt8, depth: UInt8, kind: UInt8
     }
     private func contents(_ s: IndexStore) -> [String: Attributes] {
         s.read {
             var out: [String: Attributes] = [:]
             for i in 0..<s.count where s.isLive(UInt32(i)) {
-                out[s.path(UInt32(i))] = Attributes(size: s.sizeC[i], mtime: s.mtime[i], flags: s.flags[i], depth: s.depth[i], kind: s.kind[i])
+                out[s.path(UInt32(i))] = Attributes(size: s.sizeC[i], mtime: s.mtime[i], mtimeNsec: s.mtimeNsec[i], flags: s.flags[i], depth: s.depth[i], kind: s.kind[i])
             }
             return out
         }

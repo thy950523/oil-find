@@ -51,6 +51,9 @@ typedef struct {
     uint64_t fileid;
     uint64_t size;
     int64_t mtime;
+    /* Sub-second part of mtime, 0..999999999. Whole seconds cannot distinguish two edits inside
+       one second, which the content index's change detection has to see. */
+    int64_t mtime_nsec;
 } oilfind_dirent;
 int sift_read_dir(int fd, void *scratch, size_t scratch_size, oilfind_dirent *out, int out_cap);
 uint64_t sift_entry_hash(uint32_t parent, const uint8_t *name, size_t len, int case_sensitive);

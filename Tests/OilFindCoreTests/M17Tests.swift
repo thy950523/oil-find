@@ -125,11 +125,14 @@ final class M17Tests: XCTestCase {
             XCTAssertEqual(store.compacted().coverage, store.coverage)
             let data = try Data(contentsOf: db)
             XCTAssertGreaterThan(data.count, 256)
-            var legacy = data
+            // A file from the previous format version must be rejected rather than misread: version
+            // 3 has no sub-second mtime array, so its entries are four bytes shorter. The manager
+            // falls back to a full rescan when this returns nil.
+            var previous = data
             let length = (0..<4).reduce(0) { $0 | Int(data[116 + $1]) << ($1 * 8) }
-            legacy.removeLast(length); legacy[8] = 2
-            try legacy.write(to: db)
-            XCTAssertEqual(try XCTUnwrap(IndexStore.load(from: db.path)).coverage, CoverageStats())
+            previous.removeLast(length); previous[8] = 3
+            try previous.write(to: db)
+            XCTAssertNil(IndexStore.load(from: db.path))
         }
     }
     func testBatchedNameNegationPreservesFullEvaluationScores() throws {

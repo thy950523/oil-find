@@ -86,7 +86,7 @@ extension IndexStore {
         scopeFingerprint = config.scopeFingerprint
         coverage = scan.coverage
         nameOff.update(from: off, count: off.count)
-        parent[0] = 0; sizeC[0] = 0; mtime[0] = 0; flags[0] = SiftFlag.dir
+        parent[0] = 0; sizeC[0] = 0; mtime[0] = 0; mtimeNsec[0] = 0; flags[0] = SiftFlag.dir
         depth[0] = UInt8(min(config.rootPath.split(separator: "/").count, 255)); kind[0] = 1
         DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
             let buffer = scan.buffers[worker]
@@ -94,7 +94,7 @@ extension IndexStore {
                 var position = 0
                 for j in buffer.ids.indices {
                     let i = Int(buffer.ids[j]), len = Int(buffer.nameLens[j])
-                    parent[i] = buffer.parents[j]; sizeC[i] = buffer.sizes[j]; mtime[i] = buffer.mtimes[j]
+                    parent[i] = buffer.parents[j]; sizeC[i] = buffer.sizes[j]; mtime[i] = buffer.mtimes[j]; mtimeNsec[i] = buffer.mtimesNsec[j]
                     flags[i] = buffer.flags[j]; depth[i] = buffer.depths[j]; kind[i] = buffer.kinds[j]
                     if len > 0 { names.advanced(by: Int(off[i])).update(from: raw.baseAddress!.advanced(by: position), count: len) }
                     position += len

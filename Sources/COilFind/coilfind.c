@@ -255,7 +255,7 @@ int sift_read_dir(int fd,void *scratch,size_t scratch_size,oilfind_dirent *out,i
         if(got.commonattr&ATTR_CMN_NAME) { attrreference_t ref; uint8_t *refp=p; TAKE(ref,sizeof(ref)); uint8_t *str=refp+ref.attr_dataoffset; if(str<cur||str>=end){errno=EIO;return -1;} e.name=(const char*)str; e.name_len=(uint32_t)strnlen((const char*)str,(size_t)(end-str)); }
         if(got.commonattr&ATTR_CMN_DEVID) { dev_t v; TAKE(v,sizeof(v)); e.dev=v; }
         if(got.commonattr&ATTR_CMN_OBJTYPE) { fsobj_type_t v; TAKE(v,sizeof(v)); e.type=v==VDIR?1:v==VLNK?2:v==VREG?0:3; }
-        if(got.commonattr&ATTR_CMN_MODTIME) { struct timespec v; TAKE(v,sizeof(v)); e.mtime=v.tv_sec; }
+        if(got.commonattr&ATTR_CMN_MODTIME) { struct timespec v; TAKE(v,sizeof(v)); e.mtime=v.tv_sec; e.mtime_nsec=v.tv_nsec; }
         if(got.commonattr&ATTR_CMN_FLAGS) TAKE(e.bsd_flags,sizeof(uint32_t));
         if(got.commonattr&ATTR_CMN_FILEID) TAKE(e.fileid,sizeof(uint64_t));
         if(got.fileattr&ATTR_FILE_DATALENGTH) TAKE(e.size,sizeof(uint64_t));
@@ -269,6 +269,7 @@ int sift_read_dir(int fd,void *scratch,size_t scratch_size,oilfind_dirent *out,i
             else {
                 e.fileid=target.st_ino; e.dev=target.st_dev; e.bsd_flags=target.st_flags;
                 e.mtime=target.st_mtimespec.tv_sec;
+                e.mtime_nsec=target.st_mtimespec.tv_nsec;
             }
         }
         out[k]=e; cur=end;

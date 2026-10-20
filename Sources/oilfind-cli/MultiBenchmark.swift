@@ -14,7 +14,7 @@ func multiBenchmark(db: String, args: [String]) {
             else if i % 1000 == 1 { name = "文档-\(i).md" }
             else { name = "item-\(i).\(i % 20 == 0 ? "png" : "txt")" }
             buffer.ids.append(UInt32(i)); buffer.parents.append(0); buffer.sizes.append(UInt32(i * 10))
-            buffer.mtimes.append(1_700_000_000 + UInt32(i % 1000)); buffer.flags.append(SiftFlag.userArea)
+            buffer.mtimes.append(1_700_000_000 + UInt32(i % 1000)); buffer.mtimesNsec.append(0); buffer.flags.append(SiftFlag.userArea)
             buffer.depths.append(3); buffer.kinds.append(i % 20 == 0 ? 4 : 3)
             buffer.nameLens.append(UInt32(name.utf8.count)); buffer.nameBytes.append(contentsOf: name.utf8)
         }

@@ -21,7 +21,7 @@ private final class Subtree {
     var parent: UnsafeMutablePointer<UInt32>, nameOff: UnsafeMutablePointer<UInt32>
     var type: UnsafeMutablePointer<UInt32>, bsdFlags: UnsafeMutablePointer<UInt32>
     var fileid: UnsafeMutablePointer<UInt64>, dev: UnsafeMutablePointer<Int32>
-    var size: UnsafeMutablePointer<UInt64>, mtime: UnsafeMutablePointer<Int64>, names: UnsafeMutablePointer<UInt8>
+    var size: UnsafeMutablePointer<UInt64>, mtime: UnsafeMutablePointer<Int64>, mtimeNsec: UnsafeMutablePointer<Int64>, names: UnsafeMutablePointer<UInt8>
     private static func alloc<T>(_ t: T.Type, _ n: Int) -> UnsafeMutablePointer<T> {
         malloc(n * MemoryLayout<T>.stride)!.bindMemory(to: t, capacity: n)
     }
@@ -29,10 +29,11 @@ private final class Subtree {
         parent = Self.alloc(UInt32.self, 256); nameOff = Self.alloc(UInt32.self, 257)
         type = Self.alloc(UInt32.self, 256); bsdFlags = Self.alloc(UInt32.self, 256)
         fileid = Self.alloc(UInt64.self, 256); dev = Self.alloc(Int32.self, 256)
-        size = Self.alloc(UInt64.self, 256); mtime = Self.alloc(Int64.self, 256); names = Self.alloc(UInt8.self, 4096)
+        size = Self.alloc(UInt64.self, 256); mtime = Self.alloc(Int64.self, 256)
+        mtimeNsec = Self.alloc(Int64.self, 256); names = Self.alloc(UInt8.self, 4096)
         nameOff[0] = 0
     }
-    deinit { free(parent); free(nameOff); free(type); free(bsdFlags); free(fileid); free(dev); free(size); free(mtime); free(names) }
+    deinit { free(parent); free(nameOff); free(type); free(bsdFlags); free(fileid); free(dev); free(size); free(mtime); free(mtimeNsec); free(names) }
     private func grow<T>(_ p: inout UnsafeMutablePointer<T>, _ n: Int) {
         p = realloc(p, n * MemoryLayout<T>.stride)!.bindMemory(to: T.self, capacity: n)
     }
@@ -40,18 +41,18 @@ private final class Subtree {
         if count == capacity {
             capacity += capacity / 2
             grow(&parent, capacity); grow(&nameOff, capacity+1); grow(&type, capacity)
-            grow(&bsdFlags, capacity); grow(&self.fileid, capacity); grow(&self.dev, capacity); grow(&size, capacity); grow(&mtime, capacity)
+            grow(&bsdFlags, capacity); grow(&self.fileid, capacity); grow(&self.dev, capacity); grow(&size, capacity); grow(&mtime, capacity); grow(&mtimeNsec, capacity)
         }
         if namesLen + name.count > namesCapacity {
             namesCapacity = max(namesLen + name.count, namesCapacity + namesCapacity / 2); grow(&names, namesCapacity)
         }
         self.fileid[count] = fileid; self.dev[count] = dev
         parent[count] = UInt32(p); type[count] = attrs.type; bsdFlags[count] = attrs.bsdFlags
-        size[count] = attrs.size; mtime[count] = attrs.mtime
+        size[count] = attrs.size; mtime[count] = attrs.mtime; mtimeNsec[count] = attrs.mtimeNsec
         if !name.isEmpty { names.advanced(by: namesLen).update(from: name.baseAddress!, count: name.count) }
         namesLen += name.count; count += 1; nameOff[count] = UInt32(namesLen)
     }
-    func attrs(_ i: Int) -> EntryAttrs { EntryAttrs(type: type[i], bsdFlags: bsdFlags[i], size: size[i], mtime: mtime[i]) }
+    func attrs(_ i: Int) -> EntryAttrs { EntryAttrs(type: type[i], bsdFlags: bsdFlags[i], size: size[i], mtime: mtime[i], mtimeNsec: mtimeNsec[i]) }
     func name(_ i: Int) -> UnsafeBufferPointer<UInt8> {
         UnsafeBufferPointer(start: names.advanced(by: Int(nameOff[i])), count: Int(nameOff[i+1]-nameOff[i]))
     }
@@ -108,7 +109,7 @@ public final class IndexUpdater {
         }
         guard ok, devices.contains(s.st_dev) else { return nil }
         let t = s.st_mode & S_IFMT
-        return EntryAttrs(type: t == S_IFDIR ? 1 : t == S_IFLNK ? 2 : t == S_IFREG ? 0 : 3, bsdFlags: s.st_flags, size: UInt64(max(0, s.st_size)), mtime: Int64(s.st_mtimespec.tv_sec))
+        return EntryAttrs(type: t == S_IFDIR ? 1 : t == S_IFLNK ? 2 : t == S_IFREG ? 0 : 3, bsdFlags: s.st_flags, size: UInt64(max(0, s.st_size)), mtime: Int64(s.st_mtimespec.tv_sec), mtimeNsec: Int64(s.st_mtimespec.tv_nsec))
     }
     public func apply(_ changes: [FSChange], to store: IndexStore) -> ApplySummary {
         apply(changes, to: store, mutationTime: nil)
@@ -368,7 +369,7 @@ public final class IndexUpdater {
         guard rootHandle.use({ fstat($0, &opened) }) == 0, opened.st_mode & S_IFMT == S_IFDIR,
               opened.st_ino == expected.st_ino, opened.st_dev == expected.st_dev,
               devices.contains(opened.st_dev) else { release(rootHandle); return nil }
-        let rootAttrs = EntryAttrs(type: 1, bsdFlags: opened.st_flags, size: UInt64(max(0, opened.st_size)), mtime: Int64(opened.st_mtimespec.tv_sec))
+        let rootAttrs = EntryAttrs(type: 1, bsdFlags: opened.st_flags, size: UInt64(max(0, opened.st_size)), mtime: Int64(opened.st_mtimespec.tv_sec), mtimeNsec: Int64(opened.st_mtimespec.tv_nsec))
         let tree = Subtree()
         let rootName = root == config.rootPath ? [] : Array(path.suffix(from: (path.lastIndex(of: 47) ?? -1)+1))
         rootName.withUnsafeBufferPointer { tree.append(parent: 0, name: $0, attrs: rootAttrs) }
@@ -418,7 +419,7 @@ public final class IndexUpdater {
                             path.withUnsafeBufferPointer { if let reason = config.exclusionReason(path: $0, isDirectory: e.type == 1) { coverage.record(reason, path: $0) } }
                             return
                         }
-                        tree.append(parent: parent, name: name, attrs: EntryAttrs(type: e.type, bsdFlags: e.bsd_flags, size: e.size, mtime: e.mtime), fileid: e.fileid, dev: e.dev)
+                        tree.append(parent: parent, name: name, attrs: EntryAttrs(type: e.type, bsdFlags: e.bsd_flags, size: e.size, mtime: e.mtime, mtimeNsec: e.mtime_nsec), fileid: e.fileid, dev: e.dev)
                     }
                     if raw.contains(where: { $0 >= 128 }) { Array(String(decoding: raw, as: UTF8.self).precomposedStringWithCanonicalMapping.utf8).withUnsafeBufferPointer(append) }
                     else { append(raw) }

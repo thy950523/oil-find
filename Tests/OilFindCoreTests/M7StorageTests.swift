@@ -57,13 +57,13 @@ final class M7StorageTests: XCTestCase {
             let store = persistenceStore()
             try store.save(to: url.path)
             let original = try Data(contentsOf: url)
-            XCTAssertEqual(original[8], 3)
+            XCTAssertEqual(original[8], 4)
             XCTAssertNotNil(IndexStore.load(from: url.path))
 
             let count = 3, namesLen = 2, altCount = 2
             let nameOffStart = 257
             let parentStart = nameOffStart + (count + 1) * 4
-            let namesStart = 256 + 1 + (count + 1) * 4 + count * 12 + count * 3
+            let namesStart = 256 + 1 + (count + 1) * 4 + count * 16 + count * 3
             let kindStart = namesStart - count
             let altOffStart = namesStart + namesLen
             let altOwnerStart = altOffStart + (altCount + 1) * 4
@@ -96,6 +96,9 @@ final class M7StorageTests: XCTestCase {
             try rejects("name length must convert to Int safely") { data in self.put64(UInt64.max, at: 16, in: &data) }
             try rejects("alternate name length must convert to Int safely") { data in self.put64(UInt64.max, at: 32, in: &data) }
             try rejects("format version 1 must be rebuilt") { data in self.put32(1, at: 8, in: &data) }
+            // Version 3 predates the sub-second mtime array, so its entries are four bytes shorter
+            // and would misparse. Rejecting it is what makes the manager fall back to a rescan.
+            try rejects("format version 3 must be rebuilt") { data in self.put32(3, at: 8, in: &data) }
         }
     }
 

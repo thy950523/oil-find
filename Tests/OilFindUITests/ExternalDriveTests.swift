@@ -15,7 +15,7 @@ final class ExternalDriveTests: XCTestCase {
     }
     private func store(path: String) -> IndexStore {
         var buffer = ScanBuffer()
-        buffer.ids = [0, 1]; buffer.parents = [0, 0]; buffer.sizes = [0, 1024]; buffer.mtimes = [0, 1_790_000_000]
+        buffer.ids = [0, 1]; buffer.parents = [0, 0]; buffer.sizes = [0, 1024]; buffer.mtimes = [0, 1_790_000_000]; buffer.mtimesNsec = [0, 0]
         buffer.flags = [1, 0x80]; buffer.depths = [2, 3]; buffer.kinds = [1, 3]
         buffer.nameLens = [0, 9]; buffer.nameBytes = Array("README.md".utf8)
         return IndexStore(scan: ScanOutput(buffers: [buffer], count: 2, homeIndex: .max, elapsed: 0, finishedAt: 0), config: IndexConfig(rootPath: path))

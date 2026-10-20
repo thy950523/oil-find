@@ -206,6 +206,30 @@ final class M6Tests: XCTestCase {
         }
     }
 
+    /// An incremental update must refresh the sub-second stamp too. Leaving it at zero would make
+    /// every touched file look changed to the content index forever, so it would re-parse the whole
+    /// index on every sync.
+    func testT53bIncrementalUpdateRefreshesSubSecondMtime() throws {
+        try withTree { root in
+            let file = root.appendingPathComponent("stamp.txt")
+            try Data([65]).write(to: file)
+            var config = IndexConfig.standard(); config.rootPath = root.path
+            let store = try scan(config); store.write { store.buildHash() }
+            let id = try XCTUnwrap(store.resolve(path: file.path))
+
+            // 0.25 is exact in binary, so the file system stores exactly 250_000_000 nanoseconds.
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: 1_700_000_000.25)], ofItemAtPath: file.path)
+            _ = IndexUpdater(config: config).apply([FSChange(path: file.path)], to: store)
+
+            var status = stat()
+            XCTAssertEqual(lstat(file.path, &status), 0)
+            XCTAssertEqual(store.mtime[Int(id)], UInt32(status.st_mtimespec.tv_sec))
+            XCTAssertEqual(store.mtimeNsec[Int(id)], UInt32(status.st_mtimespec.tv_nsec))
+            XCTAssertEqual(store.mtimeNsec[Int(id)], 250_000_000)
+        }
+    }
+
     func testT53FileWithDependencyNameAndPackageRoot() throws {
         try withTree { root in
             let file = root.appendingPathComponent("node_modules")

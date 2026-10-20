@@ -14,6 +14,10 @@ public final class IndexStore {
     public var fsEventsUUID: String = ""
     public internal(set) var nameOff: UnsafeMutablePointer<UInt32>, parent: UnsafeMutablePointer<UInt32>
     public internal(set) var sizeC: UnsafeMutablePointer<UInt32>, mtime: UnsafeMutablePointer<UInt32>
+    /// Sub-second part of `mtime`, 0..999_999_999. Parallel to every other array here. Kept beside
+    /// `mtime` rather than folded into it so every consumer that only needs second resolution —
+    /// scoring, sorting, the date filter — reads unchanged.
+    public internal(set) var mtimeNsec: UnsafeMutablePointer<UInt32>
     public internal(set) var flags: UnsafeMutablePointer<UInt8>, depth: UnsafeMutablePointer<UInt8>, kind: UnsafeMutablePointer<UInt8>
     public internal(set) var names: UnsafeMutablePointer<UInt8>
     public internal(set) var altOff: UnsafeMutablePointer<UInt32>, altOwner: UnsafeMutablePointer<UInt32>, altNames: UnsafeMutablePointer<UInt8>
@@ -36,13 +40,14 @@ public final class IndexStore {
         self.caseSensitiveNames = caseSensitiveNames
         nameOff = Self.alloc(UInt32.self, capacity + 1); parent = Self.alloc(UInt32.self, capacity)
         sizeC = Self.alloc(UInt32.self, capacity); mtime = Self.alloc(UInt32.self, capacity)
+        mtimeNsec = Self.alloc(UInt32.self, capacity)
         flags = Self.alloc(UInt8.self, capacity); depth = Self.alloc(UInt8.self, capacity); kind = Self.alloc(UInt8.self, capacity)
         names = Self.alloc(UInt8.self, namesCapacity); altOff = Self.alloc(UInt32.self, altCapacity + 1)
         altOwner = Self.alloc(UInt32.self, altCapacity); altNames = Self.alloc(UInt8.self, altNamesCapacity)
         pthread_rwlock_init(&rwlock, nil)
     }
     deinit {
-        free(nameOff); free(parent); free(sizeC); free(mtime)
+        free(nameOff); free(parent); free(sizeC); free(mtime); free(mtimeNsec)
         free(flags); free(depth); free(kind); free(names)
         free(table); free(altOff); free(altOwner); free(altNames)
         pthread_rwlock_destroy(&rwlock)
@@ -78,5 +83,5 @@ public final class IndexStore {
     public func size(_ i: UInt32) -> UInt64 { Self.decodeSize(sizeC[Int(i)]) }
     public func modified(_ i: UInt32) -> Date { Date(timeIntervalSince1970: TimeInterval(mtime[Int(i)])) }
     public func isLive(_ i: UInt32) -> Bool { flags[Int(i)] & SiftFlag.deleted == 0 }
-    public var allocatedBytes: Int { (capacity + 1) * 4 + capacity * 4 * 3 + capacity * 3 + namesCapacity + (altCapacity + 1) * 4 + altCapacity * 4 + altNamesCapacity + tableCapacity * 4 }
+    public var allocatedBytes: Int { (capacity + 1) * 4 + capacity * 4 * 4 + capacity * 3 + namesCapacity + (altCapacity + 1) * 4 + altCapacity * 4 + altNamesCapacity + tableCapacity * 4 }
 }

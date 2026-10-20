@@ -92,6 +92,23 @@ final class M1Tests: XCTestCase {
             if let d=attrs[.modificationDate] as? Date { XCTAssertEqual(Int(f.store.mtime[i]),Int(d.timeIntervalSince1970),path) }
         }
     } }
+    /// The sub-second part of the modification time must survive the C scanner, the scan buffer and
+    /// the store. Second resolution alone cannot tell two edits inside one second apart, and the
+    /// content index's change detection depends on the difference.
+    func testT4bScanCarriesSubSecondMtime() throws { try withFixture { f in
+        var sawNonZero = false
+        for i in 1..<f.store.count {
+            let path = f.store.path(UInt32(i))
+            var status = stat()
+            guard lstat(path, &status) == 0 else { continue }
+            XCTAssertEqual(Int64(f.store.mtime[i]), Int64(status.st_mtimespec.tv_sec), path)
+            XCTAssertEqual(Int64(f.store.mtimeNsec[i]), Int64(status.st_mtimespec.tv_nsec), path)
+            if f.store.mtimeNsec[i] != 0 { sawNonZero = true }
+        }
+        // The fixture pins `src/known.bin` to a whole second, so a store that hard-coded zero would
+        // satisfy every comparison above. Require at least one entry with a real sub-second stamp.
+        XCTAssertTrue(sawNonZero)
+    } }
     func testT5Invariants() throws { try withFixture { f in
         XCTAssertEqual(f.store.nameOff[f.store.count],UInt32(f.store.namesLen))
         for i in 1..<f.store.count {
@@ -119,12 +136,13 @@ final class M1Tests: XCTestCase {
         XCTAssertEqual(loaded.count,f.store.count)
         XCTAssertEqual(loaded.namesLen,f.store.namesLen)
         XCTAssertEqual(loaded.altCount,f.store.altCount)
-        for i in 0..<f.store.count { XCTAssertEqual(loaded.path(UInt32(i)),f.store.path(UInt32(i))); XCTAssertEqual(loaded.flags[i],f.store.flags[i]); XCTAssertEqual(loaded.sizeC[i],f.store.sizeC[i]); XCTAssertEqual(loaded.mtime[i],f.store.mtime[i]) }
+        for i in 0..<f.store.count { XCTAssertEqual(loaded.path(UInt32(i)),f.store.path(UInt32(i))); XCTAssertEqual(loaded.flags[i],f.store.flags[i]); XCTAssertEqual(loaded.sizeC[i],f.store.sizeC[i]); XCTAssertEqual(loaded.mtime[i],f.store.mtime[i]); XCTAssertEqual(loaded.mtimeNsec[i],f.store.mtimeNsec[i]) }
         func same<T>(_ a: UnsafePointer<T>, _ b: UnsafePointer<T>, _ n: Int) -> Bool { memcmp(a,b,n*MemoryLayout<T>.stride) == 0 }
         XCTAssertTrue(same(loaded.nameOff,f.store.nameOff,f.store.count+1))
         XCTAssertTrue(same(loaded.parent,f.store.parent,f.store.count))
         XCTAssertTrue(same(loaded.sizeC,f.store.sizeC,f.store.count))
         XCTAssertTrue(same(loaded.mtime,f.store.mtime,f.store.count))
+        XCTAssertTrue(same(loaded.mtimeNsec,f.store.mtimeNsec,f.store.count))
         XCTAssertTrue(same(loaded.flags,f.store.flags,f.store.count))
         XCTAssertTrue(same(loaded.depth,f.store.depth,f.store.count))
         XCTAssertTrue(same(loaded.kind,f.store.kind,f.store.count))

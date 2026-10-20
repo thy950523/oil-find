@@ -6,7 +6,7 @@ import OilFindCore
 final class SupplementarySearchTests: XCTestCase {
     private func store() -> IndexStore {
         let names = ["", "发票.png", "older.png", "newer.png"]
-        var buffer = ScanBuffer(); buffer.ids = [0,1,2,3]; buffer.parents = [0,0,0,0]; buffer.sizes = [0,100,200,300]; buffer.mtimes = [0,20,10,30]; buffer.flags = [1,128,128,128]; buffer.depths = [0,1,1,1]; buffer.kinds = [1,4,4,4]; buffer.nameLens = names.map { UInt32($0.utf8.count) }; buffer.nameBytes = Array(names.joined().utf8)
+        var buffer = ScanBuffer(); buffer.ids = [0,1,2,3]; buffer.parents = [0,0,0,0]; buffer.sizes = [0,100,200,300]; buffer.mtimes = [0,20,10,30]; buffer.mtimesNsec = [0,0,0,0]; buffer.flags = [1,128,128,128]; buffer.depths = [0,1,1,1]; buffer.kinds = [1,4,4,4]; buffer.nameLens = names.map { UInt32($0.utf8.count) }; buffer.nameBytes = Array(names.joined().utf8)
         return IndexStore(scan: ScanOutput(buffers: [buffer], count: 4, homeIndex: .max, elapsed: 0, finishedAt: 0), config: IndexConfig(rootPath: "/generated"))
     }
     func testDetailKeepsFolderAndOnlyFolderTruncates() throws {

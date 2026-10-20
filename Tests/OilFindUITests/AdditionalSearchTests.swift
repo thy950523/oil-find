@@ -61,7 +61,7 @@ final class AdditionalSearchTests: XCTestCase {
     }
     private func source() -> SearchSource {
         let names = ["", "shared.swift"]
-        var b = ScanBuffer(); b.ids = [0,1]; b.parents = [0,0]; b.sizes = [0,100]; b.mtimes = [0,10]; b.flags = [1,128]; b.depths = [0,1]; b.kinds = [1,7]
+        var b = ScanBuffer(); b.ids = [0,1]; b.parents = [0,0]; b.sizes = [0,100]; b.mtimes = [0,10]; b.mtimesNsec = [0,0]; b.flags = [1,128]; b.depths = [0,1]; b.kinds = [1,7]
         b.nameLens = names.map { UInt32($0.utf8.count) }; b.nameBytes = Array(names.joined().utf8)
         let store = IndexStore(scan: ScanOutput(buffers: [b], count: 2, homeIndex: .max, elapsed: 0, finishedAt: 0), config: IndexConfig(rootPath: "/generated"))
         return SearchSource(id: "fixture", displayName: "", isOnline: true, store: store)
