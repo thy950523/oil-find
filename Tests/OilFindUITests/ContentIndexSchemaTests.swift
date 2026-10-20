@@ -34,7 +34,7 @@ final class ContentIndexSchemaTests: XCTestCase {
         _ = try ContentIndex(url: url)
         let sql = try AITopicSQL(url, readOnly: true)
         // Rebuilt from scratch, so the table is canonical rather than having columns bolted on.
-        XCTAssertTrue(try sql.columns("files").isSuperset(of: ["size", "mtime", "kind", "parser", "revision"]))
+        XCTAssertTrue(try sql.columns("files").isSuperset(of: ["size", "mtime", "mtime_nsec", "kind", "parser", "revision"]))
         XCTAssertTrue(try sql.tables().contains("chunk_fts"))
         let probe = try sql.prepare("PRAGMA user_version")
         XCTAssertTrue(try probe.next())
@@ -44,7 +44,7 @@ final class ContentIndexSchemaTests: XCTestCase {
         let url = tempURL(); defer { removeDatabase(url) }
         let index = try ContentIndex(url: url)
         try index.sql.run("""
-            INSERT INTO files(id, path, size, mtime, kind, parser) VALUES(1, '/a/b.txt', 1, 1, 3, 'text');
+            INSERT INTO files(id, path, size, mtime, mtime_nsec, kind, parser) VALUES(1, '/a/b.txt', 1, 1, 0, 3, 'text');
             INSERT INTO chunks(id, file, ordinal, label, folded, bytes) VALUES(1, 1, 0, '第 1 页', X'00', 0);
             INSERT INTO chunk_fts(rowid, grams) VALUES(1, 'abc');
             """)
@@ -66,7 +66,7 @@ final class ContentIndexSchemaTests: XCTestCase {
         let url = tempURL(); defer { removeDatabase(url) }
         do {
             let index = try ContentIndex(url: url)
-            try index.sql.run("INSERT INTO files(path,size,mtime,kind,parser) VALUES('/a/b.txt',1,1,3,'text')")
+            try index.sql.run("INSERT INTO files(path,size,mtime,mtime_nsec,kind,parser) VALUES('/a/b.txt',1,1,0,3,'text')")
         }
         // A rebuild would drop the row; the version stamp must make the second open a no-op.
         XCTAssertEqual(try ContentIndex(url: url).count(), 1)

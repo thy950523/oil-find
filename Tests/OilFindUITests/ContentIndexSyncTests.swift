@@ -14,8 +14,9 @@ final class ContentIndexSyncTests: XCTestCase {
     override func tearDownWithError() throws { index = nil; removeContentDatabase(url) }
 
     /// Indexes one file with a single chunk so the stored metadata is non-trivial.
-    private func seed(_ path: String, size: Int64, mtime: Int64) throws {
-        try index.store(file: .init(path: path, size: size, mtime: mtime, kind: 3, parser: "text"),
+    private func seed(_ path: String, size: Int64, mtime: Int64, mtimeNsec: Int64 = 0) throws {
+        try index.store(file: .init(path: path, size: size, mtime: mtime, mtimeNsec: mtimeNsec,
+                                    kind: 3, parser: "text"),
                         chunks: [.init(ordinal: 0, label: "第 1 行附近", text: "开具发票的日期")])
     }
 
@@ -119,6 +120,27 @@ final class ContentIndexSyncTests: XCTestCase {
             .init(path: "/a/1.txt", size: 10, mtime: 100, kind: 3, parser: "ocr"),
         ])
         XCTAssertEqual(plan.changed.map(\.path), ["/a/1.txt"])
+    }
+
+    /// Two edits inside one second that leave the size alone are indistinguishable at second
+    /// resolution, so the sub-second part of the modification time is part of the identity too.
+    /// Without it the second edit is classified `unchanged` and the old text stays searchable.
+    func testClassifierTreatsANanosecondOnlyChangeAsChanged() throws {
+        try seed("/a/1.txt", size: 10, mtime: 100, mtimeNsec: 100_000_000)
+        let plan = try index.plan(candidates: [
+            .init(path: "/a/1.txt", size: 10, mtime: 100, mtimeNsec: 900_000_000, kind: 3, parser: "text"),
+        ])
+        XCTAssertEqual(plan.changed.map(\.path), ["/a/1.txt"])
+    }
+
+    /// The complement of the test above: an identical sub-second part must still classify as
+    /// `unchanged`, or every sync would re-parse the whole index.
+    func testClassifierTreatsAnIdenticalNanosecondAsUnchanged() throws {
+        try seed("/a/1.txt", size: 10, mtime: 100, mtimeNsec: 250_000_000)
+        let plan = try index.plan(candidates: [
+            .init(path: "/a/1.txt", size: 10, mtime: 100, mtimeNsec: 250_000_000, kind: 3, parser: "text"),
+        ])
+        XCTAssertEqual(plan.unchanged.map(\.path), ["/a/1.txt"])
     }
 
     /// A chunk size that does not divide the record count leaves a final partial batch; the loop

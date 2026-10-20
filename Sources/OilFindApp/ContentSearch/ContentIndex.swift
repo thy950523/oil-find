@@ -15,15 +15,29 @@ struct ContentChunk {
     let text: String
 }
 
-/// A file as seen in the file index. `size` and `mtime` form the identity used by incremental
-/// sync; `kind` is the file-index kind (3 = document, 4 = image) and `parser` is the identifier
-/// of the `ContentParser` that produced its chunks.
+/// A file as seen in the file index. `size`, `mtime` and `mtimeNsec` form the identity used by
+/// incremental sync; `kind` is the file-index kind (3 = document, 4 = image) and `parser` is the
+/// identifier of the `ContentParser` that produced its chunks.
 struct ContentFileRecord {
     let path: String
     let size: Int64
     let mtime: Int64
+    /// Nanosecond part of the modification time, 0..999_999_999. `mtime` alone is whole seconds,
+    /// which cannot tell two edits inside one second apart.
+    let mtimeNsec: Int64
     let kind: UInt8
     let parser: String
+
+    /// `mtimeNsec` defaults to 0 so a caller that only cares about second resolution — most tests,
+    /// and any future source of records without sub-second stamps — reads unchanged.
+    init(path: String, size: Int64, mtime: Int64, mtimeNsec: Int64 = 0, kind: UInt8, parser: String) {
+        self.path = path
+        self.size = size
+        self.mtime = mtime
+        self.mtimeNsec = mtimeNsec
+        self.kind = kind
+        self.parser = parser
+    }
 }
 
 /// A verified content match inside one file. `path` is the absolute path, never an entry id: the
@@ -44,7 +58,7 @@ final class ContentIndex {
 
     /// Bumped whenever the canonical schema changes. The index is derived and rebuildable, so a
     /// mismatch is repaired by rebuilding rather than migrated column by column.
-    static let schemaVersion = 1
+    static let schemaVersion = 2
 
     let sql: AITopicSQL
     /// False when the database could not be switched to WAL mode, which some network home
@@ -163,6 +177,10 @@ final class ContentIndex {
                         path TEXT NOT NULL UNIQUE,
                         size INTEGER NOT NULL,
                         mtime INTEGER NOT NULL,
+                        -- Sub-second part of the modification time. Without it a second edit inside
+                        -- the same second that leaves the size alone is indistinguishable from the
+                        -- first, and the stale text stays searchable.
+                        mtime_nsec INTEGER NOT NULL,
                         kind INTEGER NOT NULL,
                         parser TEXT NOT NULL,
                         revision INTEGER NOT NULL DEFAULT 1);
@@ -231,13 +249,14 @@ extension ContentIndex {
     }
 
     func file(path: String) throws -> (record: ContentFileRecord, id: Int64, revision: Int64)? {
-        let statement = try statement("SELECT id, size, mtime, kind, parser, revision FROM files WHERE path=?")
+        let statement = try statement("SELECT id, size, mtime, mtime_nsec, kind, parser, revision FROM files WHERE path=?")
         defer { sqlite3_reset(statement.handle) }
         statement.bind([path])
         guard try step(statement) else { return nil }
         let record = ContentFileRecord(path: path, size: statement.int(1), mtime: statement.int(2),
-                                       kind: UInt8(truncatingIfNeeded: statement.int(3)), parser: statement.text(4))
-        return (record, statement.int(0), statement.int(5))
+                                       mtimeNsec: statement.int(3),
+                                       kind: UInt8(truncatingIfNeeded: statement.int(4)), parser: statement.text(5))
+        return (record, statement.int(0), statement.int(6))
     }
 
     // Do not add a second `file(path:)` overload that differs only in return type:
@@ -246,20 +265,21 @@ extension ContentIndex {
     func upsert(file record: ContentFileRecord) throws -> Int64 {
         if let existing = try file(path: record.path) {
             guard existing.record.size != record.size || existing.record.mtime != record.mtime
+                || existing.record.mtimeNsec != record.mtimeNsec
                 || existing.record.kind != record.kind || existing.record.parser != record.parser else {
                 return existing.id
             }
-            let statement = try statement("UPDATE files SET size=?, mtime=?, kind=?, parser=?, revision=revision+1 WHERE id=?")
+            let statement = try statement("UPDATE files SET size=?, mtime=?, mtime_nsec=?, kind=?, parser=?, revision=revision+1 WHERE id=?")
             defer { sqlite3_reset(statement.handle) }
-            statement.bind([String(record.size), String(record.mtime), String(record.kind),
-                            record.parser, String(existing.id)])
+            statement.bind([String(record.size), String(record.mtime), String(record.mtimeNsec),
+                            String(record.kind), record.parser, String(existing.id)])
             _ = try step(statement)
             return existing.id
         }
-        let statement = try statement("INSERT INTO files(path,size,mtime,kind,parser) VALUES(?,?,?,?,?)")
+        let statement = try statement("INSERT INTO files(path,size,mtime,mtime_nsec,kind,parser) VALUES(?,?,?,?,?,?)")
         defer { sqlite3_reset(statement.handle) }
         statement.bind([record.path, String(record.size), String(record.mtime),
-                        String(record.kind), record.parser])
+                        String(record.mtimeNsec), String(record.kind), record.parser])
         _ = try step(statement)
         return sqlite3_last_insert_rowid(sql.db)
     }
@@ -527,9 +547,9 @@ extension ContentIndex {
         var removed: [String] = []
     }
 
-    /// Classifies `candidates` against the stored rows. `size`, `mtime` and `parser` all equal means
-    /// the file is already indexed exactly as it stands; any difference forces a re-parse, and an
-    /// absent row is new.
+    /// Classifies `candidates` against the stored rows. `size`, `mtime`, `mtimeNsec` and `parser`
+    /// all equal means the file is already indexed exactly as it stands; any difference forces a
+    /// re-parse, and an absent row is new.
     ///
     /// `complete` is false when the candidate enumeration could not finish. `removed` is computed
     /// only when `complete` is true, from a complete snapshot: deleting on a partial one would wipe
@@ -546,6 +566,7 @@ extension ContentIndex {
                 continue
             }
             if existing.record.size == candidate.size, existing.record.mtime == candidate.mtime,
+               existing.record.mtimeNsec == candidate.mtimeNsec,
                existing.record.parser == candidate.parser {
                 result.unchanged.append(candidate)
             } else {

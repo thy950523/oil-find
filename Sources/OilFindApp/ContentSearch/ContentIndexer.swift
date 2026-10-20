@@ -61,6 +61,7 @@ final class ContentIndexer {
                     batch.append(ContentFileRecord(path: path,
                                                    size: Int64(store.size(id)),
                                                    mtime: Int64(store.mtime[position]),
+                                                   mtimeNsec: Int64(store.mtimeNsec[position]),
                                                    kind: kind,
                                                    parser: parser.identifier))
                 }

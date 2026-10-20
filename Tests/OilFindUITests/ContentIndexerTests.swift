@@ -46,6 +46,9 @@ final class ContentIndexerTests: XCTestCase {
         let name: String
         let kind: UInt8
         var flags: UInt8 = 0
+        /// Sub-second part of the entry's mtime. Two entries that differ only here stand for two
+        /// edits inside one second that left the size alone.
+        var mtimeNsec: UInt32 = 0
     }
 
     /// Index 0 is the root directory, as the real scanner produces, and every entry is its direct
@@ -58,7 +61,8 @@ final class ContentIndexerTests: XCTestCase {
         for (offset, entry) in entries.enumerated() {
             Array(entry.name.utf8).withUnsafeBufferPointer {
                 buffer.append(id: UInt32(offset + 1), parent: 0, size: UInt32(offset + 1),
-                              mtime: UInt32(offset + 1), flags: entry.flags, depth: 1, kind: entry.kind, name: $0)
+                              mtime: UInt32(offset + 1), mtimeNsec: entry.mtimeNsec,
+                              flags: entry.flags, depth: 1, kind: entry.kind, name: $0)
             }
         }
         let store = IndexStore(scan: ScanOutput(buffers: [buffer], count: entries.count + 1, homeIndex: .max,
@@ -92,6 +96,23 @@ final class ContentIndexerTests: XCTestCase {
         try indexer.synchronize(store: store, isCancelled: { false })
 
         XCTAssertEqual(try XCTUnwrap(index.file(path: path)).revision, revision)
+    }
+
+    /// A second edit inside the same second that leaves the size alone must still be re-parsed. The
+    /// file index's sub-second stamp has to reach the content index's identity, or the edit is
+    /// invisible and the first edit's text stays searchable.
+    func testReparsesASameSecondSameSizeEdit() throws {
+        let indexer = ContentIndexer(index: index, parsers: [StubParser()])
+        let path = directory.appendingPathComponent("note.txt").path
+
+        try indexer.synchronize(store: makeStore([Entry(name: "note.txt", kind: 3)]), isCancelled: { false })
+        XCTAssertEqual(try XCTUnwrap(index.file(path: path)).revision, 1)
+
+        // Same name, same size, same second: only the sub-second part of the mtime moved.
+        try indexer.synchronize(store: makeStore([Entry(name: "note.txt", kind: 3, mtimeNsec: 500)]),
+                                isCancelled: { false })
+
+        XCTAssertEqual(try XCTUnwrap(index.file(path: path)).revision, 2)
     }
 
     func testRemovedFileIsDroppedFromTheIndex() throws {
