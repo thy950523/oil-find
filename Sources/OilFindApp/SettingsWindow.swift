@@ -195,7 +195,11 @@ final class SettingsModel: ObservableObject {
     /// hold snapshots taken at launch, and re-reading three of them is more ways to go wrong than
     /// restarting once.
     func confirmClearAllSettings(in window: NSWindow?) {
-        guard !snapshot, let window else { return }
+        // Refuse while an update is installing: `applicationShouldTerminate` returns
+        // `.terminateCancel` for `update.preventsTermination` (the same condition the Quit menu
+        // uses at AppDelegate:256), so the reset could wipe settings and arm the relaunch watcher
+        // and then fail to terminate. Better to never offer the action than to half-perform it.
+        guard !snapshot, !update.preventsTermination, let window else { return }
         let alert = NSAlert()
         alert.messageText = L10n.text("settings.resetAll")
         alert.informativeText = L10n.text("settings.resetConfirm")
