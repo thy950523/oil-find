@@ -211,8 +211,10 @@ final class SettingsModel: ObservableObject {
         }
     }
     private func clearAllSettingsAndRelaunch() {
-        // Arm the relaunch first: if it cannot start, nothing has been destroyed yet.
-        guard relaunch() else { return }
+        // Re-check: an update can begin installing while the confirmation sheet is up, after the
+        // check in `confirmClearAllSettings` has already passed. Arm the relaunch first: if it
+        // cannot start, nothing has been destroyed yet.
+        guard !update.preventsTermination, relaunch() else { return }
         SettingsPreferences.clearAll(in: preferences)
         // "Open at Login" is SMAppService state, not a UserDefaults preference, so `clearAll`
         // cannot reach it. Leaving it registered would contradict the reset just confirmed.
