@@ -9,6 +9,22 @@ export const changelogTitle = { zh: '更新日志', en: 'Changelog' };
 // The single source for the website and the packaged update manifest.
 export const releases: Release[] = [
   {
+    "version": "1.7.2",
+    "date": "2026-10-21",
+    "notes": {
+      "zh": [
+        "修复了整盘索引重建有时像是永远跑不完的问题：打开文件数达到系统上限时，不再发布一份不完整的文件目录，而是保留原有索引并自动重试。",
+        "图片和文档的文字识别会在接近这个上限前先停下，下一轮继续；没有权限或读不到的文件单独计数，不再反复尝试。",
+        "设置里会显示版本号和这一版的发布日期。"
+      ],
+      "en": [
+        "Fixed a full index rebuild that could appear to never finish: when the number of open files reaches the system limit, Oil Find keeps the existing index and retries on its own instead of publishing an incomplete one.",
+        "Image and document text recognition now stops before reaching that limit and continues on the next pass. Files that can't be read are counted separately instead of being retried over and over.",
+        "Settings now shows the version number together with this release's date."
+      ]
+    }
+  },
+  {
     "version": "1.7.1",
     "date": "2026-10-17",
     "notes": {

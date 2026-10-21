@@ -29,13 +29,16 @@ final class PackagedBuildTests: XCTestCase {
         XCTAssertNil(PackagedBuild.parse(Date()))
     }
 
-    /// The time is shown in the reader's own zone, so the same instant reads differently in another
-    /// one. Without this the date would be the packaging machine's local time wearing a UTC label.
-    func testTextUsesTheGivenCalendarZone() {
+    /// Only the day reaches the settings row: the time of day tells a user nothing they can act on.
+    /// It is shown in the reader's own zone, so the same instant reads differently in another one —
+    /// without this the date would be the packaging machine's local day wearing a UTC label.
+    func testDayTextUsesTheGivenCalendarZone() {
         let instant = date(2026, 10, 21, 0, 15, 0)
-        XCTAssertEqual(PackagedBuild.text(instant, calendar: utc), "2026-10-21 00:15")
+        XCTAssertEqual(PackagedBuild.dayText(instant, calendar: utc), "2026-10-21")
         var shanghai = utc
         shanghai.timeZone = TimeZone(identifier: "Asia/Shanghai")!
-        XCTAssertEqual(PackagedBuild.text(instant, calendar: shanghai), "2026-10-21 08:15")
+        XCTAssertEqual(PackagedBuild.dayText(instant, calendar: shanghai), "2026-10-21")
+        // Late enough in UTC to be the next day east of it, which is where the zone has to be read.
+        XCTAssertEqual(PackagedBuild.dayText(date(2026, 10, 21, 20, 0, 0), calendar: shanghai), "2026-10-22")
     }
 }

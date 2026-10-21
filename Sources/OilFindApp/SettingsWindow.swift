@@ -294,13 +294,12 @@ private struct UpdateSettingsRow: View {
                 Spacer()
                 Button(L10n.text("update.check")) { update.check() }.disabled(!update.canCheck)
             }
-            HStack(spacing: 6) {
-                Text(UpdateManager.current.version.text)
-                // Hidden in a development build, which has no packaging step to date.
-                if let packaged = PackagedBuild.date {
-                    Text(L10n.text("update.packaged", PackagedBuild.text(packaged)))
-                }
-            }.font(.footnote).foregroundStyle(.secondary)
+            // The date is the release's, taken from the packaging step rather than a constant, so it
+            // cannot drift from the build it labels. A development build has no packaging step and
+            // therefore no date, and shows the version alone.
+            Text(PackagedBuild.date.map { L10n.text("update.versionDate", UpdateManager.current.version.text, PackagedBuild.dayText($0)) }
+                 ?? UpdateManager.current.version.text)
+                .font(.footnote).foregroundStyle(.secondary)
         }
     }
 }

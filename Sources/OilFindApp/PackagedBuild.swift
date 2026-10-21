@@ -17,14 +17,16 @@ enum PackagedBuild {
         return ISO8601DateFormatter().date(from: text)
     }
 
-    /// Fixed rather than localized, and it includes the time: the date is quoted when reporting a
-    /// problem with one specific build, and `2026-10-21 00:15` reads the same to everyone.
-    static func text(_ date: Date, calendar: Calendar = .current) -> String {
+    /// The day the bundle was packaged, in the reader's own time zone. Fixed rather than localized,
+    /// and numeric rather than spelled out: the value is quoted when reporting a problem with one
+    /// specific build, and `2026-10-21` reads the same to everyone. Only the day is shown — the time
+    /// of day tells a user nothing they can act on, and the full timestamp stays in `Info.plist`.
+    static func dayText(_ date: Date, calendar: Calendar = .current) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: date)
     }
 }
